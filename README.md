@@ -143,6 +143,61 @@ rejects a manifest mismatch instead of silently mixing model families/revisions.
 
 ## Train and Continue
 
+### Local 4-bit NumPy Trial
+
+For a pretrained-model experiment on a small NVIDIA GPU, install the optional
+4-bit dependency in the project environment:
+
+```bash
+python -m pip install -r requirements-4bit.txt
+python algo.py trial
+```
+
+This loads `codellama/CodeLlama-7b-hf` with NF4 double quantization, freezes the
+base weights, uses 100 NumPy training examples, and evaluates the SAME 50 separate
+validation examples before and after fitting the gate. All rows come from the
+prepared HF data; no random model is substituted. The base model is loaded once.
+Defaults use CUDA, FP16 computation, SDPA attention, a 512-token context window,
+and 64 generated tokens. Quantization reduces GPU weight memory, but the first
+run still downloads full original model weights and can need substantial disk
+space and host RAM. An 8 GB GPU is not a guarantee that every context/model fits.
+Model downloads are cached under `.cache/huggingface/hub` in the project by
+default (`--cache-dir` overrides this), so later runs reuse the downloaded weights.
+
+Outputs under `results/numpy_4bit_trial/`:
+
+- `baseline.json`: written before gate training, so inspect whether M0 can emit API calls.
+- `step_000.pt`, `step_001.pt`: baseline and learned steering checkpoint.
+- `comparison.json`: paired predictions, counts, outcome transitions, and retain-NLL change.
+
+Look for `deprecated->correct_rep`, not just `deprecated->mismatch`. Also inspect
+`correct_rep->deprecated`, `correct_rep->mismatch`, and `delta_retain_nll` (a large
+positive value signals degradation). Gate validation accuracy alone is not an
+unlearning result. Sample counts are capped at available rows without duplication.
+
+PowerShell in this workspace:
+
+```powershell
+$py = ".\.venv\Scripts\python.exe"
+& $py algo.py trial
+$r = Get-Content results/numpy_4bit_trial/comparison.json -Raw | ConvertFrom-Json
+$r.baseline.summary
+$r.steered.summary
+$r.transitions
+$r.delta_retain_nll
+```
+
+To compare layer/strength settings, rerun with a NEW output directory and the
+same seed, e.g. `--layer 12 --strength 0.5 --output results/numpy_l12_s05`.
+Tune on validation only, then evaluate on the independent test split. Existing
+output directories are protected from accidental overwrite. No automatic
+hyperparameter search or output-probability loss is introduced in this change.
+
+Other model commands also accept `--quantization 4bit`; loading a gate checkpoint
+requires matching quantization and recorded compute dtype. Never reuse gates
+from the random-model smoke check as CodeLlama gates. This trial remains a
+single-task development check, not a full continual-unlearning experiment.
+
 ```bash
 python algo.py train --model codellama/CodeLlama-7b-hf
 ```

@@ -358,14 +358,28 @@ class Engine:
 
 
 def load_engine(args, metadata=None):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
     if metadata and args.model != metadata["model"]:
         raise ValueError("Use the same --model as the steering checkpoint")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    quantization = getattr(args, "quantization", "none")
+    if metadata and quantization != metadata.get("quantization", "none"):
+        raise ValueError("Use the same --quantization as the steering checkpoint")
+    if metadata and "dtype" in metadata and args.dtype != metadata["dtype"]:
+        raise ValueError("Use the same --dtype as the steering checkpoint")
+    options = {}
+    if quantization == "4bit":
+        if not torch.cuda.is_available() or args.device == "cpu":
+            raise ValueError("This 4-bit configuration requires an NVIDIA CUDA GPU")
+        options["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=getattr(torch, args.dtype))
+    cache_dir = getattr(args, "cache_dir", ".cache/huggingface/hub")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, cache_dir=cache_dir)
     dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=dtype,
-                                               device_map=args.device, attn_implementation="eager")
+                                               device_map=args.device, cache_dir=cache_dir,
+                                               attn_implementation="sdpa", **options)
     layer = metadata["layer"] if metadata else args.layer
     if layer == -1:
         layer = len(get_layers(model)) // 2
@@ -375,6 +389,73 @@ def load_engine(args, metadata=None):
     if max_length > getattr(model.config, "max_position_embeddings", max_length):
         raise ValueError("--max-length exceeds this model's context window")
     return Engine(model, tokenizer, layer, max_length)
+
+
+def trial(args):
+    """A paired pretrained-model experiment; validation examples never fit the gate."""
+    data = read_json(args.data)
+    check_model_family(args.model, data.get("source"))
+    tasks = [t for t in data["tasks"] if t["name"] == args.library]
+    if len(tasks) != 1:
+        raise ValueError("--library must name one task in the prepared data")
+    task = tasks[0]
+    train_rows = sample(task["train"], args.train_samples, args.seed)
+    eval_rows = sample(task["validation"], args.eval_samples, args.seed)
+    if not train_rows or not eval_rows:
+        raise ValueError("Trial needs nonempty training and validation splits")
+    if {r["context_hash"] for r in train_rows} & {r["context_hash"] for r in eval_rows}:
+        raise ValueError("Train/validation context overlap")
+    output = Path(args.output)
+    if (output / "baseline.json").exists():
+        raise ValueError("Trial output already exists; use a new --output directory")
+    torch.manual_seed(args.seed)
+    engine = load_engine(args)
+    metadata = {"model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
+                "quantization": args.quantization, "dtype": args.dtype, "dataset_source": data.get("source"),
+                "dataset_hash": fingerprint(json.dumps(data, sort_keys=True)), "library": args.library}
+
+    def evaluate_bank(bank):
+        examples = []
+        retain_sum, retain_tokens = 0., 0
+        for i, row in enumerate(eval_rows):
+            generated = engine.generate(row["prompt"], bank, args.max_new_tokens)
+            clean = engine.prompt_ids(row["retain"])
+            boundary = max(1, len(clean) // 2)
+            if boundary >= len(clean):
+                raise ValueError("Retain example needs at least two tokens")
+            score = engine.score(clean[:boundary], clean[boundary:], bank)
+            retain_sum += score["sum"]
+            retain_tokens += score["tokens"]
+            examples.append({"id": row.get("id"), "source_index": row["source_index"],
+                             "generated": generated, **classify_generation(generated, row)})
+            print(f"  evaluated {i + 1}/{len(eval_rows)}", flush=True)
+        return {"summary": {**generation_counts(examples), "retain_nll": -retain_sum / retain_tokens},
+                "examples": examples}
+
+    print(f"Baseline: {args.library}, {len(eval_rows)} validation examples", flush=True)
+    baseline = evaluate_bank([])
+    write_json(output / "baseline.json", {"metadata": metadata, **baseline})
+    save_checkpoint(output / "step_000.pt", metadata, [])
+    print(f"Fit gate: {len(train_rows)} training examples", flush=True)
+    feat = features(engine, train_rows)
+    item = fit_gate(feat, args)
+    item.update(task=args.library, train_samples=len(feat["prompt"]),
+                train_skipped_context_ids=feat["skipped_context_ids"])
+    save_checkpoint(output / "step_001.pt", metadata, [item])
+    print("Steered evaluation on the SAME validation examples", flush=True)
+    steered = evaluate_bank([item])
+    transitions = Counter(f"{before['outcome']}->{after['outcome']}"
+                          for before, after in zip(baseline["examples"], steered["examples"]))
+    report = {"metadata": metadata, "train_samples": item["train_samples"],
+              "train_source_indices": [r["source_index"] for r in train_rows],
+              "seed": args.seed, "max_new_tokens": args.max_new_tokens,
+              "strength": args.strength, "cosine_weight": args.cosine_weight,
+              "gate_steps": args.gate_steps, "baseline": baseline, "steered": steered,
+              "transitions": dict(transitions), "delta_retain_nll":
+              steered["summary"]["retain_nll"] - baseline["summary"]["retain_nll"]}
+    write_json(output / "comparison.json", report)
+    print(json.dumps({"baseline": baseline["summary"], "steered": steered["summary"],
+                      "transitions": dict(transitions), "report": str(output / "comparison.json")}), flush=True)
 
 
 def sample(rows, limit, seed):
@@ -472,6 +553,9 @@ def train(args):
                 "seed": args.seed, "method": "contrastive-mean+sigmoid-gate+cosine"}
     if data.get("source"):
         metadata["dataset_source"] = data["source"]
+    if args.quantization != "none":
+        metadata["quantization"] = args.quantization
+        metadata["dtype"] = args.dtype
     bank = checkpoint["bank"] if checkpoint else []
     if checkpoint and checkpoint["metadata"] != metadata:
         raise ValueError("Resume requires identical model, prepared data, task order and seed")
@@ -791,14 +875,31 @@ def parser():
     prep.add_argument("--seed", type=int, default=42)
     prep.set_defaults(func=prepare)
     for name, function in (("train", train), ("evaluate", evaluate), ("generate", generate),
-                           ("evaluate-api", evaluate_api)):
+                           ("evaluate-api", evaluate_api), ("trial", trial)):
         command = commands.add_parser(name)
         command.add_argument("--model", default="codellama/CodeLlama-7b-hf")
         command.add_argument("--device", default="auto")
         command.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float16")
         command.add_argument("--layer", type=int, default=-1)
         command.add_argument("--max-length", type=int, default=1024)
+        command.add_argument("--quantization", choices=["none", "4bit"], default="none")
+        command.add_argument("--cache-dir", default=".cache/huggingface/hub")
         command.set_defaults(func=function)
+        if name == "trial":
+            command.set_defaults(quantization="4bit", device="cuda", max_length=512)
+            command.add_argument("--data", default="data/codellama/prepared.json")
+            command.add_argument("--library", default="numpy")
+            command.add_argument("--train-samples", type=int, default=100)
+            command.add_argument("--eval-samples", type=int, default=50)
+            command.add_argument("--seed", type=int, default=42)
+            command.add_argument("--output", default="results/numpy_4bit_trial")
+            command.add_argument("--gate-steps", type=int, default=300)
+            command.add_argument("--lr", type=float, default=.01)
+            command.add_argument("--weight-decay", type=float, default=.01)
+            command.add_argument("--cosine-weight", type=float, default=.1)
+            command.add_argument("--strength", type=float, default=1.)
+            command.add_argument("--max-new-tokens", type=int, default=64)
+            continue
         if name == "evaluate-api":
             command.add_argument("--forget", default="data/codellama/D_forget.json")
             command.add_argument("--test", default="data/codellama/D_test.json")
@@ -845,13 +946,15 @@ def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     args = parser().parse_args()
-    for key in ("max_samples", "validation_samples", "max_new_tokens", "cosine_weight", "strength", "stop_after"):
+    for key in ("max_samples", "validation_samples", "max_new_tokens", "cosine_weight", "strength", "stop_after", "train_samples", "eval_samples"):
         if hasattr(args, key) and getattr(args, key) < 0:
             raise ValueError(f"--{key.replace('_', '-')} must be nonnegative")
     if hasattr(args, "gate_steps") and args.gate_steps < 1:
         raise ValueError("--gate-steps must be positive")
     if hasattr(args, "val_fraction") and not 0 < args.val_fraction < 1:
         raise ValueError("--val-fraction must be between zero and one")
+    if args.command == "trial" and args.max_new_tokens < 1:
+        raise ValueError("trial requires positive --max-new-tokens")
     args.func(args)
 
 

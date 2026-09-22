@@ -182,6 +182,20 @@ class SteeringTests(unittest.TestCase):
             model_path = root / "model"
             self.engine.model.save_pretrained(model_path)
             self.tokenizer.save_pretrained(model_path)
+            run("trial", "--model", model_path, "--device", "cpu", "--dtype", "float32",
+                "--quantization", "none", "--data", prepared, "--library", "alpha",
+                "--max-length", "256", "--train-samples", "2", "--eval-samples", "1",
+                "--gate-steps", "5", "--max-new-tokens", "2", "--output", root / "trial")
+            comparison = algo.read_json(root / "trial" / "comparison.json")
+            self.assertEqual(comparison["baseline"]["summary"]["evaluated"], 1)
+            self.assertEqual(comparison["steered"]["summary"]["evaluated"], 1)
+            self.assertEqual(sum(comparison["transitions"].values()), 1)
+            baseline_indices = {r["source_index"] for r in comparison["baseline"]["examples"]}
+            self.assertEqual(baseline_indices, {r["source_index"] for r in comparison["steered"]["examples"]})
+            self.assertFalse(baseline_indices & set(comparison["train_source_indices"]))
+            state = algo.load_checkpoint(root / "trial" / "step_001.pt")
+            with self.assertRaisesRegex(ValueError, "quantization"):
+                algo.load_engine(SimpleNamespace(model=str(model_path), quantization="4bit"), state["metadata"])
             checkpoint_dir = root / "checkpoints"
             common = ["--model", model_path, "--device", "cpu", "--dtype", "float32", "--data", prepared]
             training = ["train", *common, "--output", checkpoint_dir, "--max-length", "256",
