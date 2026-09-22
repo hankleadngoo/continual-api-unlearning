@@ -148,6 +148,54 @@ the reference answer. A one-token prompt is supported.
 
 ## Evaluate
 
+### Generated API Counts on Both Raw Datasets
+
+The main evaluation now generates code for every valid row in the original
+`D_forget.json` and `D_test.json`, including duplicates, mixed categories, training
+examples, and rows without `y_pos`/`y_neg`/`retain`. It does not substitute the
+prepared validation split for the full forget dataset. The algorithm and existing
+checkpoints are unchanged; no retraining or re-preparation is needed.
+
+```bash
+python algo.py evaluate-api --checkpoint checkpoints/step_008.pt
+```
+
+Omit `--checkpoint` to evaluate every stage, including `step_000.pt` (M0).
+Default output: `results/api_counts.json`. Default generation is greedy, 64 new
+tokens, with `--max-samples 0` meaning the entire raw dataset. A positive sample
+limit selects that many rows per dataset, not per library.
+
+| Count | Definition |
+| --- | --- |
+| `no_dep_count` | No targeted deprecated API call in the generated continuation |
+| `correct_rep_count` | Target replacement call present, with no targeted deprecated call |
+| `mismatch_count` | Neither targeted deprecated nor target replacement call present |
+| `deprecated_count` | At least one targeted deprecated call, even if replacement also appears |
+| `both_dep_and_rep_count` | Both call types present; a subset of deprecated_count |
+
+`no_dep_count = correct_rep_count + mismatch_count`.
+`evaluated = deprecated_count + correct_rep_count + mismatch_count`.
+These are sample counts, not numbers of call occurrences. Each count also has a
+rate using `evaluated` as denominator. Empty output is mismatch, not correct rep.
+Correct rep means API-name correctness, not verified arguments or functional
+correctness. A truncated `np.prod(` counts as a replacement call-name prefix.
+
+Matching uses Python tokenization of generated text only, excluding comments,
+string literals and function/class definitions. It resolves exact aliases from
+each row's `alias dict`, without executing code. It does not resolve arbitrary
+runtime bindings or infer new aliases. On tokenization errors, already-tokenized
+calls are used and the error is recorded per example for audit. Calls already in
+the prompt are not counted. Prompt input remains `probing input`.
+
+The JSON includes per-dataset totals, per-library/category counts, every generated
+continuation and its classification, file fingerprints, and skipped source row
+indices/reasons. Blank prompts or missing API labels are skipped and explicitly
+reported, never counted as successful forgetting. Missing completion targets do
+not prevent generation evaluation. Full D_forget metrics include training data
+and are not an independent generalization estimate.
+
+### Optional Probability Diagnostics
+
 Tune layer, strength and cosine weight on validation, in separate output folders:
 
 ```bash
@@ -182,7 +230,10 @@ Generate with a cumulative checkpoint:
 python algo.py generate --checkpoint checkpoints/step_008.pt --prompt-file data/prompt.txt
 ```
 
-On Bash/WSL, `bash run_script.sh` runs prepare, train and validation. Any arguments
+On Bash/WSL, `bash run_script.sh` runs prepare, train and full generated API-count
+evaluation on both raw datasets at every checkpoint. This can be expensive: nine
+checkpoints require nine generations per valid sample across both datasets.
+Any arguments
 are forwarded directly, e.g. `bash run_script.sh train --stop-after 1`.
 Set `MODEL` to change the no-argument pipeline's model, and `PYTHON` to select
 the interpreter. On PowerShell run the equivalent `python algo.py ...` commands.

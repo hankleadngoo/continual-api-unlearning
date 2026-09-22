@@ -10,5 +10,4 @@ fi
 
 "$PYTHON" algo.py prepare
 "$PYTHON" algo.py train --model "$MODEL"
-"$PYTHON" algo.py evaluate --model "$MODEL" --split validation --output results/validation.json
-# Use held-out test only after selecting hyperparameters on validation.
+"$PYTHON" algo.py evaluate-api --model "$MODEL" --output results/api_counts.json

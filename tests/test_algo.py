@@ -96,6 +96,25 @@ class SteeringTests(unittest.TestCase):
         self.assertGreater(metrics["retain_nll"], 0)
         self.assertIn("pair_skipped", details[0])
 
+    def test_generated_api_categories_and_aliases(self):
+        row = {"deprecated api": ["numpy.product"], "replacement api": "numpy.prod",
+               "alias dict": {"np.product": "numpy.product", "np.prod": "numpy.prod"}}
+        cases = [("np.product(x)", "deprecated"), ("np.prod(x)", "correct_rep"),
+                 ("np.sum(x)", "mismatch"), ("np.prod(x); np.product(x)", "deprecated"),
+                 ('# np.product(x)\n"np.prod(x)"', "mismatch"), ("", "mismatch"),
+                 ("np.prod(", "correct_rep"), ("np.production(x)", "mismatch")]
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(algo.classify_generation(text, row)["outcome"], expected)
+        examples = [algo.classify_generation(text, row) for text, _ in cases]
+        counts = algo.generation_counts(examples)
+        self.assertEqual(counts["evaluated"], 8)
+        self.assertEqual(counts["no_dep_count"], 6)
+        self.assertEqual(counts["correct_rep_count"], 2)
+        self.assertEqual(counts["mismatch_count"], 4)
+        self.assertEqual(counts["both_dep_and_rep_count"], 1)
+        self.assertIsNone(algo.generation_counts([])["no_dep_rate"])
+
     def test_prepare_cli_resume_evaluate_generate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -145,6 +164,20 @@ class SteeringTests(unittest.TestCase):
             metrics = algo.read_json(output)["stages"][-1]["groups"][0]["metrics"]
             self.assertEqual(metrics["pair_samples"], 0)
             self.assertIsNone(metrics["replacement_mean_logp"])
+            # Raw evaluation must include the overlapping row excluded by prepare,
+            # and the test row without a replacement completion.
+            run("evaluate-api", "--model", model_path, "--device", "cpu", "--dtype", "float32",
+                "--checkpoint", checkpoint_dir / "step_002.pt", "--forget", root / "forget.json",
+                "--test", root / "test.json", "--max-new-tokens", "2", "--output", output)
+            report = algo.read_json(output)
+            self.assertEqual(report["stages"][0]["datasets"]["D_forget"]["summary"]["evaluated"], 10)
+            self.assertEqual(report["stages"][0]["datasets"]["D_test"]["summary"]["evaluated"], 1)
+            test.append({**test[0], "probing input": ""})
+            algo.write_json(root / "test.json", test)
+            valid, audit = algo.generation_dataset(root / "test.json")
+            self.assertEqual(len(valid), 1)
+            self.assertEqual(audit["total_rows"], 2)
+            self.assertEqual(audit["skipped_rows"], 1)
             run("generate", "--model", model_path, "--device", "cpu", "--dtype", "float32",
                 "--checkpoint", checkpoint_dir / "step_002.pt", "--prompt", "def f(x): return ",
                 "--max-new-tokens", "2")

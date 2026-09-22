@@ -4,12 +4,15 @@ import argparse
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
 import random
 import re
 import sys
+import textwrap
+import tokenize
 
 import torch
 import torch.nn.functional as F
@@ -433,6 +436,125 @@ def api_hits(text, row):
     return old, new
 
 
+def classify_generation(text, row):
+    """Match call names in generated tokens, excluding strings and comments."""
+    tokens = []
+    issue = None
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(textwrap.dedent(text)).readline):
+            if token.type not in (tokenize.COMMENT, tokenize.NL, tokenize.INDENT, tokenize.DEDENT):
+                tokens.append(token)
+    except (tokenize.TokenError, IndentationError, SyntaxError) as error:
+        # Truncated generations can still contain complete call-name prefixes.
+        issue = str(error)
+    calls = set()
+    for index, token in enumerate(tokens):
+        if token.type != tokenize.OP or token.string != "(" or index == 0:
+            continue
+        j = index - 1
+        if tokens[j].type != tokenize.NAME:
+            continue
+        parts = [tokens[j].string]
+        while j >= 2 and tokens[j - 1].string == "." and tokens[j - 2].type == tokenize.NAME:
+            parts.insert(0, tokens[j - 2].string)
+            j -= 2
+        if j and tokens[j - 1].string in ("def", "class"):
+            continue
+        calls.add(".".join(parts))
+    aliases = row.get("alias dict") or {}
+    canonical = {aliases.get(call, call) for call in calls}
+    old = bool(canonical.intersection(row["deprecated api"]))
+    new = row["replacement api"] in canonical
+    return {"outcome": "deprecated" if old else "correct_rep" if new else "mismatch",
+            "no_dep": not old, "correct_rep": new and not old, "mismatch": not old and not new,
+            "deprecated": old, "both_dep_and_rep": old and new,
+            "calls": sorted(canonical), "tokenization_issue": issue}
+
+
+def generation_dataset(path):
+    raw = read_json(path)
+    if not isinstance(raw, list):
+        raise ValueError(f"{path}: expected a JSON array")
+    rows, skipped = [], []
+    for index, row in enumerate(raw):
+        reason = None
+        if not isinstance(row, dict):
+            skipped.append({"index": index, "reason": "Record is not an object"})
+            continue
+        prompt = row.get("probing input")
+        old = row.get("deprecated api")
+        old = [old] if isinstance(old, str) else old
+        new = row.get("replacement api")
+        aliases = row.get("alias dict") or {}
+        if not isinstance(prompt, str) or not prompt.strip():
+            reason = "Missing code context"
+        elif not isinstance(old, list) or not old or not all(isinstance(x, str) and x.strip() for x in old):
+            reason = "Missing deprecated API labels"
+        elif not isinstance(new, str) or not new.strip():
+            reason = "Missing replacement API label"
+        elif not isinstance(aliases, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                     for k, v in aliases.items()):
+            reason = "Invalid alias mapping"
+        if reason:
+            skipped.append({"index": index, "id": row.get("id"), "reason": reason})
+        else:
+            rows.append({**row, "prompt": prompt, "deprecated api": old, "source_index": index})
+    return rows, {"source": str(path), "sha256": fingerprint(Path(path).read_text(encoding="utf-8-sig")),
+                  "total_rows": len(raw), "valid_rows": len(rows), "skipped_rows": len(skipped),
+                  "skipped": skipped}
+
+
+def generation_counts(examples):
+    total = len(examples)
+    counts = {key + "_count": sum(bool(row[key]) for row in examples)
+              for key in ("no_dep", "correct_rep", "mismatch", "deprecated", "both_dep_and_rep")}
+    return {"evaluated": total, **counts,
+            **{key.replace("_count", "_rate"): value / total if total else None
+               for key, value in counts.items()}}
+
+
+def evaluate_api(args):
+    if args.max_new_tokens < 1:
+        raise ValueError("evaluate-api requires --max-new-tokens > 0")
+    paths = [Path(args.checkpoint)] if args.checkpoint else sorted(Path(args.checkpoints).glob("step_*.pt"))
+    if not paths:
+        raise ValueError("No checkpoints found")
+    metadata = load_checkpoint(paths[0])["metadata"]
+    engine = load_engine(args, metadata)
+    datasets, sources = {}, {}
+    for name, path in (("D_forget", args.forget), ("D_test", args.test)):
+        rows, source = generation_dataset(path)
+        datasets[name] = sample(rows, args.max_samples, args.seed)
+        sources[name] = {**source, "selected_rows": len(datasets[name]),
+                         "sampled_out_rows": len(rows) - len(datasets[name])}
+    report = {"evaluation": "generated_api_counts", "metadata": metadata, "sources": sources,
+              "max_new_tokens": args.max_new_tokens, "seed": args.seed, "stages": []}
+    for path in paths:
+        state = load_checkpoint(path)
+        if state["metadata"] != metadata:
+            raise ValueError("Mixed experiments in checkpoint directory")
+        stage = {"checkpoint": path.name, "datasets": {}}
+        report["stages"].append(stage)
+        for name, rows in datasets.items():
+            examples = []
+            for index, row in enumerate(rows):
+                generated = engine.generate(row["prompt"], state["bank"], args.max_new_tokens)
+                examples.append({"id": row.get("id"), "source_index": row["source_index"],
+                                 "library": row.get("library"), "category": row.get("category"),
+                                 "generated": generated, **classify_generation(generated, row)})
+                if (index + 1) % 100 == 0:
+                    print(f"{path.name} {name}: {index + 1}/{len(rows)}", flush=True)
+            groups = defaultdict(list)
+            for example in examples:
+                groups[(str(example["library"]), str(example["category"]))].append(example)
+            stage["datasets"][name] = {"summary": generation_counts(examples),
+                "groups": [{"library": library, "category": category, **generation_counts(group)}
+                           for (library, category), group in sorted(groups.items())], "examples": examples}
+            write_json(args.output, report)
+            print(json.dumps({"checkpoint": path.name, "dataset": name,
+                              **stage["datasets"][name]["summary"]}), flush=True)
+
+
 def evaluate_rows(engine, rows, bank, max_new_tokens):
     totals = defaultdict(float)
     details = []
@@ -544,7 +666,8 @@ def parser():
     prep.add_argument("--val-fraction", type=float, default=.1)
     prep.add_argument("--seed", type=int, default=42)
     prep.set_defaults(func=prepare)
-    for name, function in (("train", train), ("evaluate", evaluate), ("generate", generate)):
+    for name, function in (("train", train), ("evaluate", evaluate), ("generate", generate),
+                           ("evaluate-api", evaluate_api)):
         command = commands.add_parser(name)
         command.add_argument("--model", default="codellama/CodeLlama-7b-hf")
         command.add_argument("--device", default="auto")
@@ -552,6 +675,17 @@ def parser():
         command.add_argument("--layer", type=int, default=-1)
         command.add_argument("--max-length", type=int, default=1024)
         command.set_defaults(func=function)
+        if name == "evaluate-api":
+            command.add_argument("--forget", default="data/D_forget.json")
+            command.add_argument("--test", default="data/D_test.json")
+            selection = command.add_mutually_exclusive_group()
+            selection.add_argument("--checkpoint", help="Evaluate one checkpoint only")
+            selection.add_argument("--checkpoints", default="checkpoints", help="Directory of stage checkpoints")
+            command.add_argument("--output", default="results/api_counts.json")
+            command.add_argument("--max-new-tokens", type=int, default=64)
+            command.add_argument("--max-samples", type=int, default=0, help="Per raw dataset; 0 evaluates all rows")
+            command.add_argument("--seed", type=int, default=42)
+            continue
         if name == "generate":
             command.add_argument("--checkpoint", required=True)
             prompt = command.add_mutually_exclusive_group(required=True)
