@@ -40,16 +40,53 @@ placement; CPU-only runs should use `--device cpu --dtype float32`.
 
 ## Data and Splits
 
-Input files are `data/D_forget.json` and `data/D_test.json` from the supplied
-[Google Drive folder](https://drive.google.com/drive/folders/1IQ9hSeuDFWcQaTuoHYrmN8f2IOYBc3gr).
+The canonical source is
+[tummitum/Data-Collection](https://huggingface.co/datasets/tummitum/Data-Collection).
+The pipeline pins revision `07a1ca0083ab8b0a71c18a43195330cf495f475a` by default.
+Download the split for the base model before preparing data:
+
+```bash
+python algo.py fetch-data --family codellama
+python algo.py prepare
+```
+
+Files live in `data/codellama/`: `D_forget.json`, `D_test.json`,
+`D_test_U_dep.json`, and a generated `source.json` recording revision, row counts
+and SHA-256 checksums. `prepared.json` is generated in the same directory.
+Downloads use `huggingface_hub`, already in requirements.txt. No manual SCP or
+Drive download is needed on the server. Avoid loading the entire HF repository
+as one dataset: files have different schemas and belong to different models.
+
+The benchmark defines D_forget as outdated examples plus selected up-to-dated
+examples where the corresponding model still emits deprecated APIs. Both kinds
+are forgetting examples. D_test has two subsets: `U_dep` (known deprecated-API
+errors by that model) and `U_nondep` (the remaining updated examples). U_nondep
+is computed as the multiset complement of the supplied U_dep file; there is no
+need to download its redundant large JSON file.
+
+CodeLlama raw counts: D_forget = 10,396; D_test = 17,031; U_dep = 1,310;
+U_nondep = 15,721. These supersede the earlier Drive data and its counts.
+
+Available families are `codellama`, `codegen`, `deepseek`, and `starcoder`.
+For another family, use its own paths and matching M0 checkpoint:
+
+```bash
+python algo.py fetch-data --family deepseek
+python algo.py prepare --forget data/deepseek/D_forget.json --test data/deepseek/D_test.json --output data/deepseek/prepared.json
+python algo.py train --model /path/to/deepseek-model --data data/deepseek/prepared.json --output checkpoints/deepseek_hf
+```
+
+Recognizable model-family mismatches are rejected. For a local model path without
+a recognizable family name, selecting the correct checkpoint remains the user's
+responsibility. Use `fetch-data --revision COMMIT` to explicitly change revision.
 
 | Dataset field | Meaning here |
 | --- | --- |
 | `probing input` | Code context x, before the full completion line |
 | `y_pos` | Replacement completion, desired |
-| `y_neg` | Unwanted alternative; deprecated only for appropriate outdated rows |
+| `y_neg` | Unwanted completion in the enriched forgetting examples |
 | `retain` | Candidate clean code for the gate and utility evaluation |
-| `library` | Default continual task grouping |
+| `library` | Task grouping; inferred from the canonical API root when absent |
 | `deprecated api`, `replacement api`, `alias dict` | Static API-call evaluation |
 
 The PDF reverses `y+`/`y-` names in one paragraph. The implementation consistently
@@ -59,26 +96,27 @@ therefore does not align with these full-line completion targets. Whitespace in
 completion strings is preserved. Prompt and completion tokens are encoded
 separately, so the conditional token boundary is explicit and reproducible.
 
-```bash
-python algo.py prepare
-```
-
 Preparation validates fields and records rejected IDs/reasons in `invalid`.
-Only complete `outdated` pairs train the erasure direction. It removes duplicate
+Complete pairs from both categories in D_forget train the erasure direction.
+The `up-to-dated` category is not a negative-gate label by itself. Preparation removes duplicate
 pairs and test-overlapping contexts/functions before splitting. Shared prompts
 and functions stay in the same split, using whitespace-normalized hashes.
-It constructs a disjoint retain pool from supplied retain snippets, excluding
-test code and outdated source functions, with separate train/validation retain partitions.
+It constructs retain pools from each split's supplied retain snippets and its
+replacement-completed contexts (`prompt + y_pos`). Test code and the other
+split's source functions/completed contexts are excluded. Shared retain candidates
+are removed from the validation pool, keeping the pools disjoint.
 Retain candidates containing a task's deprecated API calls are skipped. This is
 an exact normalized-text overlap check, not semantic clone detection.
 
-The supplied D_test contains only `up-to-dated` records. It is a retention/utility
-test, not a held-out forgetting benchmark. Rows with missing completions still
-contribute retain and optional generation metrics; `pair_samples` gives the
-number actually used for pair scoring. A separate unseen outdated test set is
-needed for a final forgetting claim. Outdated validation from D_forget is useful
-for development, but should not be presented as an untouched final test after
-tuning on it.
+D_test is not required to contain `id`, `library`, `retain`, `y_pos` or `y_neg`.
+Every example keeps its source row index; library names are inferred from API
+roots (`torch` maps to `pytorch`). Missing pair targets stay missing and are not
+fabricated. Optional probability diagnostics use the supplied `function` as the
+retain text when `retain` is absent and report zero pair samples where no targets
+exist. This does not affect generated API counts, which need no target completion.
+Retain training snippets are a proxy constructed from the available benchmark,
+not an independent general-code benchmark. Evaluate independent code tasks as
+well before claiming preservation of broad coding capability.
 
 Default task order is alphabetical by library, not an inferred real timeline.
 Choose an explicit order before preparation:
@@ -90,13 +128,18 @@ python algo.py prepare --task-order numpy,pandas,pytorch,scipy,seaborn,sklearn,t
 For a finer sequence, `--task-by api` groups by library plus deprecated API list.
 Prepared data records task names/order, exclusions and retain-pool sizes.
 
-For the downloaded Drive files, the default split contains 7,604 training pairs,
-840 validation pairs and 17,173 valid test rows across eight libraries. The raw
-files have 10,248 and 17,179 rows respectively. Eight records have blank contexts
-(two forget, six test); 311 outdated pairs have a blank target, 253 overlap test
-contexts/functions and 77 are duplicate pairs. The 1,161 up-to-dated forget-file
-rows are not positive forgetting examples. Train/validation retain pools contain
-1,047/116 snippets. The test has 542 valid rows without a complete target pair.
+For the pinned CodeLlama data, generation evaluation includes 10,395 forget and
+17,026 test examples; one forget and five test rows have blank prompts. Training
+preparation additionally excludes 286 context/function overlaps, 59 duplicate
+pairs and 11 incomplete pairs, yielding 9,037 training and 1,002 validation pairs.
+These filters affect training only: raw generation evaluation keeps all valid
+examples and both categories. All exclusions are recorded.
+
+**Migration from Drive:** prepare and train a new run. Old gates were fitted on
+different data with a different retain policy and cannot be resumed into this
+experiment. Defaults now use `checkpoints/codellama_hf/`, leaving old checkpoints
+and raw files untouched. Checkpoints record the HF source manifest; evaluation
+rejects a manifest mismatch instead of silently mixing model families/revisions.
 
 ## Train and Continue
 
@@ -113,7 +156,7 @@ selects a specific block. All tasks share this layer.
 
 ```bash
 python algo.py train --stop-after 1
-python algo.py train --resume checkpoints/step_001.pt
+python algo.py train --resume checkpoints/codellama_hf/step_001.pt
 ```
 
 `step_000.pt` is the unsteered baseline; later files contain the cumulative bank.
@@ -134,7 +177,7 @@ h' = h + sum_k strength_k * g_k(h_prompt) * v_k
 loss_gate = BCE(g_k, labels) + cosine_weight * (1 - cos(h_steered, mean_replacement))
 ```
 
-Positive gate examples are outdated prompt states and deprecated completion
+Positive gate examples are D_forget prompt states and unwanted completion
 states. Negative examples are replacement completion states and clean code
 prefix states. The cosine term acts only on positive examples. Direction and
 features always come from M0; only the linear gate is optimized, on CPU.
@@ -153,11 +196,11 @@ the reference answer. A one-token prompt is supported.
 The main evaluation now generates code for every valid row in the original
 `D_forget.json` and `D_test.json`, including duplicates, mixed categories, training
 examples, and rows without `y_pos`/`y_neg`/`retain`. It does not substitute the
-prepared validation split for the full forget dataset. The algorithm and existing
-checkpoints are unchanged; no retraining or re-preparation is needed.
+prepared validation split for the full forget dataset. See the migration note
+above when replacing the old Drive dataset.
 
 ```bash
-python algo.py evaluate-api --checkpoint checkpoints/step_008.pt
+python algo.py evaluate-api --checkpoint checkpoints/codellama_hf/step_008.pt
 ```
 
 Omit `--checkpoint` to evaluate every stage, including `step_000.pt` (M0).
@@ -193,6 +236,11 @@ indices/reasons. Blank prompts or missing API labels are skipped and explicitly
 reported, never counted as successful forgetting. Missing completion targets do
 not prevent generation evaluation. Full D_forget metrics include training data
 and are not an independent generalization estimate.
+For D_test, the report also contains `subsets.U_dep` and `subsets.U_nondep` with
+the same counts/rates, without running generation twice. Subset membership is
+matched using original benchmark fields, not the optional IDs/enriched fields.
+Whole-dataset and subgroup counts use evaluated examples, with skipped rows
+reported separately.
 
 ### Optional Probability Diagnostics
 
@@ -212,7 +260,7 @@ Metrics include mean completion log probabilities, replacement preference rate,
 token-weighted retain NLL/perplexity, differences from M0, and optional generated
 deprecated/replacement call rates. Completion preference is length-normalized;
 raw sequence log probabilities and token counts are also stored per example.
-For up-to-dated rows, `alternative_mean_logp` is NOT a deprecated-API metric.
+For the raw HF D_test, pair metrics are unavailable because y_pos/y_neg are absent.
 Static call rates resolve aliases present in each record but do not execute code,
 check correctness, or perform full Python name resolution. Calls in comments or
 strings and unresolved aliases can affect this heuristic.
@@ -227,15 +275,17 @@ or proof of no catastrophic forgetting is claimed.
 Generate with a cumulative checkpoint:
 
 ```bash
-python algo.py generate --checkpoint checkpoints/step_008.pt --prompt-file data/prompt.txt
+python algo.py generate --checkpoint checkpoints/codellama_hf/step_008.pt --prompt-file data/prompt.txt
 ```
 
-On Bash/WSL, `bash run_script.sh` runs prepare, train and full generated API-count
+On Bash/WSL, `bash run_script.sh` downloads the pinned dataset, runs prepare, train and full generated API-count
 evaluation on both raw datasets at every checkpoint. This can be expensive: nine
 checkpoints require nine generations per valid sample across both datasets.
 Any arguments
 are forwarded directly, e.g. `bash run_script.sh train --stop-after 1`.
-Set `MODEL` to change the no-argument pipeline's model, and `PYTHON` to select
+Set `FAMILY` and `MODEL` together to change the no-argument pipeline's dataset
+family and model. Results go to `results/${FAMILY}_api_counts.json`.
+Set `PYTHON` to select
 the interpreter. On PowerShell run the equivalent `python algo.py ...` commands.
 
 ## Changes Relative to the Original
@@ -275,8 +325,5 @@ consistency, additive task ordering, hook cleanup, gate learning, data separatio
 checkpoint resume, evaluation and generation. Passing these checks verifies
 pipeline mechanics only; run your M0 experiment to establish effectiveness.
 
-An additional local smoke run used the actual prepared Drive data with a random
-tiny Llama: two training examples and one validation example per task, five gate
-steps, all eight continual stages, and all 72 baseline/stage-by-task validation
-evaluations. Its artifacts are under `results/offline_smoke/`; they are only
-debugging artifacts and must not be used as research results or deployed gates.
+Earlier Drive smoke artifacts under `results/offline_smoke/` are obsolete for
+the canonical HF experiment and must not be used as research results or gates.

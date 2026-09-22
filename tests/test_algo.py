@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -115,13 +116,46 @@ class SteeringTests(unittest.TestCase):
         self.assertEqual(counts["both_dep_and_rep_count"], 1)
         self.assertIsNone(algo.generation_counts([])["no_dep_rate"])
 
+    def test_hf_test_schema_and_manifest(self):
+        raw = {"category": "up-to-dated", "source": "fixture", "function": "x = np.prod(a)",
+               "probing input": "x = ", "deprecated api": ["numpy.product"],
+               "replacement api": "numpy.prod", "alias dict": {"np.prod": "numpy.prod"}}
+        normalized = algo.normalize(raw, training=False)
+        self.assertEqual(normalized["library"], "numpy")
+        self.assertEqual(normalized["replacement"], "")
+        self.assertEqual(normalized["deprecated"], "")
+        self.assertEqual(normalized["retain"], raw["function"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            family = root / "codellama"
+            for name, rows in (("D_forget.json", [raw]), ("D_test.json", [raw, raw]),
+                               ("D_test_U_dep.json", [{**raw, "id": 7, "y_pos": "np.prod(a)"}])):
+                algo.write_json(family / name, rows)
+            with patch("huggingface_hub.HfApi") as api, patch("huggingface_hub.hf_hub_download") as download:
+                api.return_value.dataset_info.return_value.sha = "pinned-revision"
+                download.side_effect = lambda repo, filename, **kwargs: str(root / filename)
+                algo.fetch_data(SimpleNamespace(family="codellama", revision="main", output=str(root)))
+                self.assertEqual(download.call_count, 3)
+                self.assertTrue(all(call.kwargs["revision"] == "pinned-revision" for call in download.call_args_list))
+            manifest = algo.data_source(family / "D_forget.json", family / "D_test.json")
+            self.assertEqual(manifest["family"], "codellama")
+            self.assertEqual(algo.test_subsets(family / "D_test.json"), {0: "U_dep", 1: "U_nondep"})
+            with self.assertRaises(ValueError):
+                algo.check_model_family("deepseek/model", manifest)
+            algo.write_json(family / "D_test_U_dep.json", [raw, raw, raw])
+            with self.assertRaises(ValueError):
+                algo.data_source(family / "D_forget.json", family / "D_test.json")
+            with self.assertRaises(ValueError):
+                algo.test_subsets(family / "D_test.json")
+
     def test_prepare_cli_resume_evaluate_generate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             rows = []
             for library in ("alpha", "beta"):
                 for i in range(5):
-                    rows.append({"id": f"{library}{i}", "library": library, "category": "outdated",
+                    rows.append({"id": f"{library}{i}", "library": library,
+                                 "category": "up-to-dated" if i == 4 else "outdated",
                                  "probing input": f"def {library}{i}(x):\n    return ",
                                  "function": f"def {library}{i}(x): return old(x)",
                                  "y_pos": "new(x)", "y_neg": "old(x)",
@@ -138,6 +172,8 @@ class SteeringTests(unittest.TestCase):
             run("prepare", "--forget", root / "forget.json", "--test", root / "test.json", "--output", prepared)
             data = algo.read_json(prepared)
             self.assertEqual(data["excluded"]["test_context_overlap"], 1)
+            self.assertEqual(sum(r["category"] == "up-to-dated" for task in data["tasks"]
+                                 for split in ("train", "validation") for r in task[split]), 2)
             for task in data["tasks"]:
                 self.assertFalse({r["context_hash"] for r in task["train"]} &
                                  {r["context_hash"] for r in task["validation"]})
@@ -172,6 +208,13 @@ class SteeringTests(unittest.TestCase):
             report = algo.read_json(output)
             self.assertEqual(report["stages"][0]["datasets"]["D_forget"]["summary"]["evaluated"], 10)
             self.assertEqual(report["stages"][0]["datasets"]["D_test"]["summary"]["evaluated"], 1)
+            algo.write_json(root / "D_test_U_dep.json", test)
+            run("evaluate-api", "--model", model_path, "--device", "cpu", "--dtype", "float32",
+                "--checkpoint", checkpoint_dir / "step_002.pt", "--forget", root / "forget.json",
+                "--test", root / "test.json", "--max-new-tokens", "2", "--output", output)
+            subsets = algo.read_json(output)["stages"][0]["datasets"]["D_test"]["subsets"]
+            self.assertEqual(subsets["U_dep"]["evaluated"], 1)
+            self.assertEqual(subsets["U_nondep"]["evaluated"], 0)
             test.append({**test[0], "probing input": ""})
             algo.write_json(root / "test.json", test)
             valid, audit = algo.generation_dataset(root / "test.json")

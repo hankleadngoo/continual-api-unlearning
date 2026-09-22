@@ -17,6 +17,71 @@ import tokenize
 import torch
 import torch.nn.functional as F
 
+DATASET_REPO = "tummitum/Data-Collection"
+DATASET_REVISION = "07a1ca0083ab8b0a71c18a43195330cf495f475a"
+DATASET_FAMILIES = ("codellama", "codegen", "deepseek", "starcoder")
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def fetch_data(args):
+    from huggingface_hub import HfApi, hf_hub_download
+
+    revision = HfApi().dataset_info(DATASET_REPO, revision=args.revision).sha
+    directory = Path(args.output) / args.family
+    manifest = {"repo": DATASET_REPO, "revision": revision, "family": args.family, "files": {}}
+    for name in ("D_forget.json", "D_test.json", "D_test_U_dep.json"):
+        path = Path(hf_hub_download(DATASET_REPO, filename=f"{args.family}/{name}",
+                                   repo_type="dataset", revision=revision, local_dir=args.output))
+        rows = read_json(path)
+        if not isinstance(rows, list):
+            raise ValueError(f"{path} must contain a JSON array")
+        manifest["files"][name] = {"rows": len(rows), "sha256": file_sha256(path)}
+        print(f"Downloaded {path}: {len(rows)} rows", flush=True)
+    write_json(directory / "source.json", manifest)
+
+
+def data_source(forget, test):
+    manifest_path = Path(forget).parent / "source.json"
+    if not manifest_path.exists():
+        return None
+    if Path(test).resolve().parent != Path(forget).resolve().parent:
+        raise ValueError("Use forget/test files from the same dataset family directory")
+    source = read_json(manifest_path)
+    for path in (forget, test):
+        expected = source["files"].get(Path(path).name, {}).get("sha256")
+        if expected != file_sha256(path):
+            raise ValueError(f"{path} differs from the downloaded dataset manifest")
+    subset = Path(test).with_name("D_test_U_dep.json")
+    if "D_test_U_dep.json" in source["files"]:
+        if not subset.exists() or file_sha256(subset) != source["files"][subset.name]["sha256"]:
+            raise ValueError("D_test_U_dep.json is missing or differs from the dataset manifest")
+    return source
+
+
+def check_model_family(model, source):
+    if source:
+        known = next((family for family in DATASET_FAMILIES if family in model.lower()), None)
+        if known and known != source["family"]:
+            raise ValueError(f"Model {model} does not match dataset family {source['family']}")
+
+
+def infer_library(row):
+    if row.get("library"):
+        return row["library"]
+    deprecated = row.get("deprecated api") or []
+    deprecated = [deprecated] if isinstance(deprecated, str) else deprecated
+    api = row.get("replacement api") or next(iter(deprecated), "")
+    root = api.split(".")[0]
+    return {"torch": "pytorch", "np": "numpy", "pd": "pandas", "tf": "tensorflow",
+            "sns": "seaborn"}.get(root, root)
+
 
 class ContextWindowError(ValueError):
     pass
@@ -43,13 +108,17 @@ def code_hash(text):
     return fingerprint(" ".join(text.split()))
 
 
-def normalize(row, task_by="library"):
+def normalize(row, task_by="library", training=True):
     # The supplied data uses y_pos=replacement and y_neg=unwanted completion.
     keys = {"prompt": "probing input", "replacement": "y_pos", "deprecated": "y_neg",
             "retain": "retain"}
     result = {}
     for key, source in keys.items():
         value = row.get(key, row.get(source))
+        if not training and key in ("replacement", "deprecated") and value is None:
+            value = ""
+        if not training and key == "retain" and not value:
+            value = row.get("function")
         if key in ("replacement", "deprecated") and isinstance(value, str) and not value.strip():
             result[key] = ""
             continue
@@ -58,6 +127,7 @@ def normalize(row, task_by="library"):
         result[key] = value
     for key in ("id", "library", "category", "deprecated api", "replacement api", "alias dict"):
         result[key] = row.get(key)
+    result["library"] = infer_library(row)
     if not isinstance(result["library"], str) or not result["library"]:
         raise ValueError("Each record needs a library")
     old = result["deprecated api"]
@@ -73,14 +143,18 @@ def normalize(row, task_by="library"):
 
 def prepare(args):
     invalid = []
+    source = data_source(args.forget, args.test)
 
     def load(path, split):
         rows = []
-        for row in read_json(path):
+        for index, row in enumerate(read_json(path)):
             try:
-                rows.append(normalize(row, args.task_by))
+                normalized = normalize(row, args.task_by, training=split == "forget")
+                normalized["source_index"] = index
+                rows.append(normalized)
             except ValueError as error:
-                invalid.append({"split": split, "id": row.get("id"), "reason": str(error)})
+                invalid.append({"split": split, "id": row.get("id"), "source_index": index,
+                                "reason": str(error)})
         if not rows:
             raise ValueError(f"No valid records in {path}")
         return rows
@@ -88,21 +162,10 @@ def prepare(args):
     train, test = load(args.forget, "forget"), load(args.test, "test")
     test_hashes = {r["context_hash"] for r in test}
     test_code = {r["group_hash"] for r in test} | {code_hash(r["retain"]) for r in test}
-    source_code = {r["group_hash"] for r in train if r["category"] == "outdated"}
-    retain_pool = sorted({r["retain"] for r in train
-                          if code_hash(r["retain"]) not in test_code | source_code})
-    random.Random(args.seed).shuffle(retain_pool)
-    if len(retain_pool) < 2:
-        raise ValueError("No disjoint retain pool; supply independent clean retain examples")
-    boundary = max(1, min(len(retain_pool) - 1, round(len(retain_pool) * args.val_fraction)))
-    val_retain, train_retain = retain_pool[:boundary], retain_pool[boundary:]
     grouped = defaultdict(list)
     seen = set()
     excluded = Counter()
     for row in train:
-        if row["category"] != "outdated":
-            excluded["not_outdated"] += 1
-            continue
         if not row["replacement"] or not row["deprecated"]:
             excluded["missing_pair"] += 1
             continue
@@ -143,7 +206,27 @@ def prepare(args):
         task = {"name": name, "train": [], "validation": []}
         for row in rows:
             split = "validation" if row["split_hash"] in val_hashes else "train"
-            pool = val_retain if split == "validation" else train_retain
+            task[split].append(row)
+        tasks.append(task)
+    split_rows = {split: [row for task in tasks for row in task[split]]
+                  for split in ("train", "validation")}
+    pools = {}
+    for split, rows in split_rows.items():
+        other = split_rows["validation" if split == "train" else "train"]
+        forbidden = test_code | {r["group_hash"] for r in other} | {
+            code_hash(r["prompt"] + r["replacement"]) for r in other}
+        # Use only supplied retain or replacement-completed contexts from this split.
+        pools[split] = {code_hash(text): text for row in rows
+                        for text in (row["retain"], row["prompt"] + row["replacement"])
+                        if code_hash(text) not in forbidden}
+    shared = sorted(pools["train"].keys() & pools["validation"].keys())
+    for key in shared:
+        del pools["validation"][key]
+    for split, rows in split_rows.items():
+        pool = sorted(pools[split].values())
+        if not pool:
+            raise ValueError(f"No disjoint retain candidates for {split}")
+        for row in rows:
             offset = int(row["context_hash"][:8], 16) % len(pool)
             for j in range(len(pool)):
                 candidate = pool[(offset + j) % len(pool)]
@@ -151,12 +234,11 @@ def prepare(args):
                     row["retain"] = candidate
                     break
             else:
-                raise ValueError(f"No clean retain example for {name}")
-            task[split].append(row)
-        tasks.append(task)
-    payload = {"version": 1, "seed": args.seed, "task_by": args.task_by,
+                raise ValueError(f"No clean retain example for {row['task']}")
+    payload = {"version": 1, "seed": args.seed, "task_by": args.task_by, "source": source,
                "tasks": tasks, "test": test, "excluded": dict(excluded), "invalid": invalid,
-               "retain_pool": {"train": len(train_retain), "validation": len(val_retain)},
+               "retain_pool": {split: len(pool) for split, pool in pools.items()},
+               "retain_strategy": "split-local supplied retain and replacement-completed context",
                "test_missing_replacement": sum(not r["replacement"] for r in test)}
     write_json(args.output, payload)
     print(json.dumps({"tasks": [{"name": t["name"], "train": len(t["train"]),
@@ -381,12 +463,15 @@ def load_checkpoint(path):
 def train(args):
     torch.manual_seed(args.seed)
     data = read_json(args.data)
+    check_model_family(args.model, data.get("source"))
     dataset_hash = fingerprint(json.dumps(data, sort_keys=True))
     checkpoint = load_checkpoint(args.resume) if args.resume else None
     engine = load_engine(args, checkpoint["metadata"] if checkpoint else None)
     metadata = {"model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
                 "dataset_hash": dataset_hash, "task_order": [t["name"] for t in data["tasks"]],
                 "seed": args.seed, "method": "contrastive-mean+sigmoid-gate+cosine"}
+    if data.get("source"):
+        metadata["dataset_source"] = data["source"]
     bank = checkpoint["bank"] if checkpoint else []
     if checkpoint and checkpoint["metadata"] != metadata:
         raise ValueError("Resume requires identical model, prepared data, task order and seed")
@@ -498,8 +583,9 @@ def generation_dataset(path):
         if reason:
             skipped.append({"index": index, "id": row.get("id"), "reason": reason})
         else:
-            rows.append({**row, "prompt": prompt, "deprecated api": old, "source_index": index})
-    return rows, {"source": str(path), "sha256": fingerprint(Path(path).read_text(encoding="utf-8-sig")),
+            rows.append({**row, "prompt": prompt, "deprecated api": old, "source_index": index,
+                         "library": infer_library(row)})
+    return rows, {"source": str(path), "sha256": file_sha256(path),
                   "total_rows": len(raw), "valid_rows": len(rows), "skipped_rows": len(skipped),
                   "skipped": skipped}
 
@@ -513,6 +599,29 @@ def generation_counts(examples):
                for key, value in counts.items()}}
 
 
+def benchmark_key(row):
+    fields = ("category", "source", "function", "probing input", "deprecated api", "replacement api")
+    return fingerprint(json.dumps({key: row.get(key) for key in fields}, sort_keys=True))
+
+
+def test_subsets(test_path):
+    subset_path = Path(test_path).with_name("D_test_U_dep.json")
+    if not subset_path.exists():
+        return None
+    remaining = Counter(benchmark_key(row) for row in read_json(subset_path))
+    labels = {}
+    for index, row in enumerate(read_json(test_path)):
+        key = benchmark_key(row)
+        if remaining[key]:
+            labels[index] = "U_dep"
+            remaining[key] -= 1
+        else:
+            labels[index] = "U_nondep"
+    if any(remaining.values()):
+        raise ValueError("D_test_U_dep is not a multiset subset of D_test; check dataset family/revision")
+    return labels
+
+
 def evaluate_api(args):
     if args.max_new_tokens < 1:
         raise ValueError("evaluate-api requires --max-new-tokens > 0")
@@ -520,7 +629,12 @@ def evaluate_api(args):
     if not paths:
         raise ValueError("No checkpoints found")
     metadata = load_checkpoint(paths[0])["metadata"]
+    source = data_source(args.forget, args.test)
+    check_model_family(args.model, source)
+    if source and metadata.get("dataset_source") != source:
+        raise ValueError("Checkpoint was not trained on this HF dataset revision/family; prepare and train a new run")
     engine = load_engine(args, metadata)
+    subsets = test_subsets(args.test)
     datasets, sources = {}, {}
     for name, path in (("D_forget", args.forget), ("D_test", args.test)):
         rows, source = generation_dataset(path)
@@ -541,6 +655,7 @@ def evaluate_api(args):
                 generated = engine.generate(row["prompt"], state["bank"], args.max_new_tokens)
                 examples.append({"id": row.get("id"), "source_index": row["source_index"],
                                  "library": row.get("library"), "category": row.get("category"),
+                                 "test_subset": subsets[row["source_index"]] if name == "D_test" and subsets is not None else None,
                                  "generated": generated, **classify_generation(generated, row)})
                 if (index + 1) % 100 == 0:
                     print(f"{path.name} {name}: {index + 1}/{len(rows)}", flush=True)
@@ -550,6 +665,10 @@ def evaluate_api(args):
             stage["datasets"][name] = {"summary": generation_counts(examples),
                 "groups": [{"library": library, "category": category, **generation_counts(group)}
                            for (library, category), group in sorted(groups.items())], "examples": examples}
+            if name == "D_test" and subsets is not None:
+                stage["datasets"][name]["subsets"] = {
+                    label: generation_counts([e for e in examples if e["test_subset"] == label])
+                    for label in ("U_dep", "U_nondep")}
             write_json(args.output, report)
             print(json.dumps({"checkpoint": path.name, "dataset": name,
                               **stage["datasets"][name]["summary"]}), flush=True)
@@ -657,10 +776,15 @@ def generate(args):
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
+    fetch = commands.add_parser("fetch-data", help="Download the pinned Hugging Face benchmark")
+    fetch.add_argument("--family", choices=DATASET_FAMILIES, default="codellama")
+    fetch.add_argument("--revision", default=DATASET_REVISION)
+    fetch.add_argument("--output", default="data")
+    fetch.set_defaults(func=fetch_data)
     prep = commands.add_parser("prepare")
-    prep.add_argument("--forget", default="data/D_forget.json")
-    prep.add_argument("--test", default="data/D_test.json")
-    prep.add_argument("--output", default="data/prepared.json")
+    prep.add_argument("--forget", default="data/codellama/D_forget.json")
+    prep.add_argument("--test", default="data/codellama/D_test.json")
+    prep.add_argument("--output", default="data/codellama/prepared.json")
     prep.add_argument("--task-by", choices=["library", "api"], default="library")
     prep.add_argument("--task-order", help="Comma-separated tasks; default: alphabetical")
     prep.add_argument("--val-fraction", type=float, default=.1)
@@ -676,11 +800,11 @@ def parser():
         command.add_argument("--max-length", type=int, default=1024)
         command.set_defaults(func=function)
         if name == "evaluate-api":
-            command.add_argument("--forget", default="data/D_forget.json")
-            command.add_argument("--test", default="data/D_test.json")
+            command.add_argument("--forget", default="data/codellama/D_forget.json")
+            command.add_argument("--test", default="data/codellama/D_test.json")
             selection = command.add_mutually_exclusive_group()
             selection.add_argument("--checkpoint", help="Evaluate one checkpoint only")
-            selection.add_argument("--checkpoints", default="checkpoints", help="Directory of stage checkpoints")
+            selection.add_argument("--checkpoints", default="checkpoints/codellama_hf", help="Directory of stage checkpoints")
             command.add_argument("--output", default="results/api_counts.json")
             command.add_argument("--max-new-tokens", type=int, default=64)
             command.add_argument("--max-samples", type=int, default=0, help="Per raw dataset; 0 evaluates all rows")
@@ -693,12 +817,12 @@ def parser():
             prompt.add_argument("--prompt-file")
             command.add_argument("--max-new-tokens", type=int, default=128)
             continue
-        command.add_argument("--data", default="data/prepared.json")
+        command.add_argument("--data", default="data/codellama/prepared.json")
         command.add_argument("--seed", type=int, default=42)
         command.add_argument("--max-samples", type=int, default=256 if name == "train" else 32,
                              help="Samples per task (evaluation: per task/category); 0 means all")
         if name == "train":
-            command.add_argument("--output", default="checkpoints")
+            command.add_argument("--output", default="checkpoints/codellama_hf")
             command.add_argument("--resume")
             command.add_argument("--stop-after", type=int, default=0,
                                  help="Stop at this total task count; 0 completes the schedule")
@@ -709,7 +833,7 @@ def parser():
             command.add_argument("--cosine-weight", type=float, default=.1)
             command.add_argument("--strength", type=float, default=1.)
         else:
-            command.add_argument("--checkpoints", default="checkpoints")
+            command.add_argument("--checkpoints", default="checkpoints/codellama_hf")
             command.add_argument("--split", choices=["validation", "test"], default="validation")
             command.add_argument("--output", default="results/validation.json")
             command.add_argument("--max-new-tokens", type=int, default=0,

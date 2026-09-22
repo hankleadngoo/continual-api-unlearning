@@ -1,9 +1,10 @@
 .venv/
 __pycache__/
 *.py[cod]
-data/*.json
-data/*.jsonl
-data/*.download
+data/**/*.json
+data/**/*.jsonl
+data/**/*.download
+data/.cache/
 checkpoints/
 results/
 .cache/
