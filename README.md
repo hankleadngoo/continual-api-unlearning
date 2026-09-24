@@ -177,6 +177,23 @@ unlearning result. Sample counts are capped at available rows without duplicatio
 
 PowerShell in this workspace:
 
+If the earlier model download stopped, run this from `project/` to resume the
+pinned CodeLlama download in `.cache/models/CodeLlama-7b-hf`, verify its weight
+checksums, and then run the 100/50 NumPy trial using those local files:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\run_local_trial.ps1
+```
+
+The runner records its phase (`downloading`, `evaluating`, `complete`, or `failed`)
+in `.cache/local_trial/status.json`. Only `complete` means the comparison is ready.
+An interrupted download reuses completed parts. If a trial has already written
+`baseline.json`, preserve it and select a fresh `-Output results/numpy_4bit_trial_2`.
+Keep the machine awake while downloading and evaluating. This runner performs
+the single-task validation trial; it does not run the full eight-task benchmark.
+
+For the standard Hugging Face cache route:
+
 ```powershell
 $py = ".\.venv\Scripts\python.exe"
 & $py algo.py trial
@@ -245,6 +262,28 @@ unchanged. Teacher-forced scoring uses this same rule, so gates cannot inspect
 the reference answer. A one-token prompt is supported.
 
 ## Evaluate
+
+### Full local 4-bit run (PowerShell)
+
+After downloading CodeLlama, run `powershell -NoProfile -ExecutionPolicy Bypass -File
+.\run_full_dataset.ps1` from `project/` (as one command). This trains all eight
+tasks with all 9,037 prepared training pairs and all 1,002 validation pairs,
+subject to the recorded context-length exclusions. It uses the tested local
+4-bit model, a 512-token context, and the default gate hyperparameters.
+It then evaluates `step_008.pt` on every valid raw D_forget and D_test row,
+generating up to 64 tokens per row. This evaluates the final cumulative bank;
+it does not evaluate every intermediate checkpoint.
+
+Checkpoints go to `checkpoints/codellama_full_4bit/` and the report to
+`results/codellama_full_4bit/api_counts.json`. Check `status.json` in that results
+directory: only `complete` means both datasets finished. A report written while
+evaluation is running may contain just D_forget. The runner refuses to overwrite
+an existing training run. A full run can take many hours or days on a laptop;
+keep it powered and awake. For a background launch with redirected logs, monitor:
+
+```powershell
+Get-Content results/codellama_full_4bit/stdout.log -Tail 10 -Wait
+```
 
 ### Generated API Counts on Both Raw Datasets
 
