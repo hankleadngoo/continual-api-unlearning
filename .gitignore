@@ -12,3 +12,6 @@ results/
 
 .test_tmp/
 *.log
+
+slurm-*.out
+slurm-*.err

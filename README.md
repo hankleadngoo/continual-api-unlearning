@@ -1,3 +1,78 @@
+# Run on a Linux server with Conda
+
+Clone the repository and enter its root (the directory containing `algo.py`).
+All server commands below use shell scripts; no virtualenv or `.env` is needed.
+Install Conda first, or load your cluster's Conda module. For noninteractive jobs,
+set `CONDA_EXE` to the absolute path to the Conda executable if it is not on PATH.
+The scripts use `conda run`, so `conda activate` is not required.
+
+```bash
+bash setup_conda.sh
+# Optional NVIDIA 4-bit dependencies:
+INSTALL_4BIT=1 UPDATE_ENV=1 bash setup_conda.sh
+```
+
+Python 3.11 and the pinned project dependencies are installed in the named Conda
+environment `continual-unlearning`. Override `ENV_NAME` consistently for setup and
+runs. Use `UPDATE_ENV=1 bash setup_conda.sh` after pulling dependency changes.
+GPU execution requires a compatible NVIDIA driver on the server.
+
+```bash
+# Downloads the pinned CodeLlama dataset, trains and evaluates on D_test:
+bash run_script.sh
+
+# Search t on the same D_test prompts (test-tuned results):
+STRENGTH_GRID="0,0.01,0.025,0.05,0.1,0.2,0.5,1" bash run_script.sh
+
+# DeepSeek model and matching dataset; uses raw probing input, no prompt wrapper:
+MODEL=deepseek-ai/deepseek-coder-1.3b-instruct FAMILY=deepseek bash run_script.sh
+
+# Quick run; EVAL_SAMPLES caps the total test count, not each subset:
+TRAIN_SAMPLES=20 EVAL_SAMPLES=20 GATE_STEPS=10 bash run_script.sh
+```
+
+Default runs use all valid training/test rows. Outputs use a fresh timestamped
+`results/<family>_pipeline_*` directory. Set `OUTPUT` to choose another empty
+location. Set `FETCH_DATA=0` to reuse local datasets, `QUANTIZATION=4bit` for NF4,
+and `DEVICE`, `DTYPE`, `MAX_LENGTH`, `MAX_NEW_TOKENS`, or `STRENGTH` as needed.
+A strength grid adds generation work for each candidate.
+
+Run detached with nohup:
+
+```bash
+mkdir -p logs
+nohup env STRENGTH_GRID="0,0.01,0.05,0.1,0.2,0.5,1" bash run_script.sh > logs/server_run.log 2>&1 < /dev/null &
+echo "PID: $!"
+tail -f logs/server_run.log
+```
+
+Run with Slurm, from the repository root:
+
+```bash
+sbatch --export=ALL run_slurm.sh
+# Override resources/partition to match your cluster:
+STRENGTH_GRID="0,0.05,0.1,0.5,1" sbatch --partition=gpu --time=48:00:00 --export=ALL run_slurm.sh
+```
+
+Slurm writes `slurm-<jobid>.out` and `.err`. The job defaults to one GPU, four CPU
+cores, 32 GB RAM and 24 hours; adjust to your model/dataset and cluster policy.
+`PROJECT_DIR` overrides the repository location when submitting elsewhere.
+Environment setup is performed once before job submission, not inside every job.
+
+For explicit CLI options, pass the subcommand through the script. This mode does
+not automatically download data or apply the default-run environment variables:
+
+```bash
+bash run_script.sh fetch-data --family codellama
+bash run_script.sh pipeline --strength-grid "0,0.05,0.1,1" --output results/custom_run
+bash run_script.sh pipeline --help
+```
+
+Per-step logs are under `<output>/logs/`; reports/checkpoints remain under
+`<output>/`. Only `comparison.json` with `complete: true` confirms evaluation
+finished. The older Windows/virtualenv examples below are historical; use the
+Conda shell commands above for team server runs.
+
 ## Search steering strength on D_test
 
 ```powershell
