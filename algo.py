@@ -932,6 +932,71 @@ def generate(args):
     print(engine.generate(prompt, state["bank"], args.max_new_tokens))
 
 
+def strength_grid(value):
+    try:
+        values = [float(part.strip()) for part in value.split(",")]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Use comma-separated finite nonnegative strengths") from error
+    if not values or any(not math.isfinite(t) or t < 0 for t in values):
+        raise argparse.ArgumentTypeError("Strengths must be finite and nonnegative")
+    return sorted(set([0.0] + values))
+
+
+def select_strength(candidates):
+    # Prefer actual replacement success; reducing dep by producing garbage is not success.
+    return min(candidates, key=lambda c: (-c["summary"]["correct_rep_count"],
+                                         c["summary"]["deprecated_count"], c["strength"]))
+
+
+def evaluate_strengths(engine, item, rows, subsets, args, output):
+    if not rows:
+        raise ValueError("No valid D_test examples to evaluate")
+    grid = getattr(args, "strength_grid", None)
+    strengths = grid if grid is not None else sorted(set([0., args.strength]))
+    search = {"complete": False, "selection_dataset": "D_test", "selected_rows": len(rows),
+              "test_sha256": file_sha256(args.test), "seed": args.seed,
+              "max_new_tokens": args.max_new_tokens,
+              "test_tuned": grid is not None,
+              "selection_rule": "max correct_rep_count, then min deprecated_count, then min strength",
+              "candidates": []}
+    baseline = None
+    for strength in strengths:
+        examples = []
+        bank = [] if strength == 0 else [dict(item, strength=strength)]
+        for index, row in enumerate(rows):
+            generated = engine.generate(row["prompt"], bank, args.max_new_tokens)
+            example = {"source_index": row["source_index"], "subset": subsets[row["source_index"]],
+                       "generated": generated, **classify_generation(generated, row)}
+            examples.append(example)
+            log_step("8.generate", strength=strength, index=index + 1, total=len(rows), **example)
+        candidate = {"strength": strength, "summary": generation_counts(examples),
+                     "subsets": {label: generation_counts([e for e in examples if e["subset"] == label])
+                                 for label in ("U_dep", "U_nondep")}}
+        path = output / "strength_candidates" / f"t_{strength!r}.json"
+        write_json(path, {**candidate, "examples": examples})
+        candidate["examples_file"] = str(path.relative_to(output))
+        search["candidates"].append(candidate)
+        log_step("9.comparison", strength=strength, dataset="D_test", **candidate["summary"])
+        for label, counts in candidate["subsets"].items():
+            log_step("9.comparison", strength=strength, subset=label, **counts)
+        counts = candidate["summary"]
+        print(f"t={strength:g} | total={counts['evaluated']} | dep={counts['deprecated_count']} | "
+              f"rep={counts['correct_rep_count']} | mismatch={counts['mismatch_count']}", flush=True)
+        if strength == 0:
+            baseline = examples
+        write_json(output / "strength_search.json", search)
+    best = select_strength(search["candidates"]) if grid is not None else next(
+        c for c in search["candidates"] if c["strength"] == args.strength)
+    search.update(complete=True, best_strength=best["strength"], best_summary=best["summary"])
+    write_json(output / "strength_search.json", search)
+    log_step("9.comparison", selection="best_in_grid" if grid is not None else "fixed_strength",
+             strength=best["strength"], **best["summary"])
+    chosen = read_json(output / best["examples_file"])["examples"]
+    paired = [{"source_index": base["source_index"], "subset": base["subset"],
+               "baseline": base, "steered": steered} for base, steered in zip(baseline, chosen)]
+    return best, paired, search
+
+
 def pipeline(args):
     output = Path(args.output)
     if output.exists() and any(output.iterdir()):
@@ -980,15 +1045,14 @@ def _run_pipeline(args):
               "context_skipped_ids": feat["skipped_context_ids"], "test_source": test_source,
               "examples": [], "subsets": {}, "complete": False}
     write_json(output / "comparison.json", report)
-    for index, row in enumerate(test_rows):
-        example = {"source_index": row["source_index"], "subset": subsets[row["source_index"]]}
-        for mode, bank in (("baseline", []), ("steered", [item])):
-            generated = engine.generate(row["prompt"], bank, args.max_new_tokens)
-            example[mode] = {"generated": generated, **classify_generation(generated, row)}
-        report["examples"].append(example)
-        log_step("8.generate", index=index + 1, total=len(test_rows), **example)
-        if (index + 1) % 100 == 0:
-            write_json(output / "comparison.json", report)
+    best, paired, search = evaluate_strengths(engine, item, test_rows, subsets, args, output)
+    report["examples"] = paired
+    report["best_strength"] = best["strength"]
+    report["test_tuned"] = search["test_tuned"]
+    report["selection_rule"] = search["selection_rule"]
+    report["summary"] = {mode: generation_counts([e[mode] for e in paired])
+                         for mode in ("baseline", "steered")}
+    save_checkpoint(output / "best_strength.pt", metadata, [dict(item, strength=best["strength"])])
     for label in ("U_dep", "U_nondep"):
         selected = [e for e in report["examples"] if e["subset"] == label]
         report["subsets"][label] = {mode: generation_counts([e[mode] for e in selected])
@@ -1028,6 +1092,8 @@ def parser():
         command.add_argument("--cache-dir", default=".cache/huggingface/hub")
         command.set_defaults(func=function)
         if name == "pipeline":
+            command.add_argument("--strength-grid", type=strength_grid,
+                                 help="Sweep D_test strengths, e.g. 0,0.01,0.05,0.1,0.2,0.5,1; selects best in grid")
             command.add_argument("--forget", default="data/codellama/D_forget.json")
             command.add_argument("--test", default="data/codellama/D_test.json")
             command.add_argument("--output", default="results/paired_pipeline")

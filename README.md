@@ -1,3 +1,26 @@
+## Search steering strength on D_test
+
+```powershell
+.\.venv\Scripts\python.exe algo.py pipeline --strength-grid "0,0.01,0.025,0.05,0.1,0.2,0.5,1" --output results/strength_search
+```
+
+This trains the gate once, then evaluates the same D_test prompts for every t.
+Zero is always included and is generated once as the baseline. Each candidate prints
+exact total/dep/rep/mismatch counts and logs totals plus U_dep/U_nondep counts.
+Rep means replacement present WITHOUT deprecated; both present counts as dep.
+Best means highest correct replacement count, then lowest deprecated count, then
+smallest t. This is best among the tested grid, not a global optimum. Selection uses
+test labels, so results are explicitly marked test-tuned, not held-out evaluation.
+`--eval-samples 0` (default) uses all valid D_test rows; a positive limit selects a sample.
+
+Outputs: `strength_search.json` (all candidate counts and selected t),
+`strength_candidates/t_*.json` (every generation), `best_strength.pt` (selected t),
+and `comparison.json` (baseline vs selected t). `step_001.pt` keeps the original
+`--strength`; use `best_strength.pt` to generate with the selected value.
+Without `--strength-grid`, evaluation keeps the fixed `--strength` behavior.
+Existing per-step logs remain under `logs/`, with t included in generation and
+comparison records. More candidate values increase generation runtime proportionally.
+
 # Paired cosine steering pipeline
 
 Run from `project/`:

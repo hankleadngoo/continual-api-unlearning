@@ -116,6 +116,32 @@ class SteeringTests(unittest.TestCase):
             self.assertEqual(entry["error_type"], "ValueError")
             self.assertIsNone(algo.STEP_LOG_DIRECTORY.get())
 
+    def test_strength_search_counts_selection_and_baseline_reuse(self):
+        row = {"prompt": "x", "source_index": 0, "deprecated api": ["old"], "replacement api": "new"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            algo.write_json(root / "test.json", [row])
+            args = argparse.Namespace(strength_grid=[0., .1, 1.], strength=1.,
+                                      test=str(root / "test.json"), seed=42, max_new_tokens=2)
+            def generate(prompt, bank, limit):
+                return "old(x)" if not bank else "new(x)" if bank[0]["strength"] == .1 else "other(x)"
+            with patch.object(self.engine, "generate", side_effect=generate) as mocked:
+                best, paired, search = algo.evaluate_strengths(
+                    self.engine, self.item, [row], {0: "U_dep"}, args, root)
+            self.assertEqual(mocked.call_count, 3)
+            self.assertEqual(best["strength"], .1)
+            self.assertEqual(best["summary"]["correct_rep_count"], 1)
+            self.assertEqual(search["candidates"][0]["summary"]["deprecated_count"], 1)
+            self.assertEqual(search["candidates"][2]["summary"]["mismatch_count"], 1)
+            self.assertTrue(search["complete"])
+            self.assertEqual(paired[0]["steered"]["generated"], "new(x)")
+            tied = [dict(best, strength=.5), dict(best, strength=.1)]
+            self.assertEqual(algo.select_strength(tied)["strength"], .1)
+        self.assertEqual(algo.strength_grid(".1,0,.1"), [0., .1])
+        for invalid in ("nan", "inf", "-1", "", "abc"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                algo.strength_grid(invalid)
+
     def test_global_pipeline_off_on_subsets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
