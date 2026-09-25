@@ -85,7 +85,63 @@ class SteeringTests(unittest.TestCase):
         item = algo.fit_gate(feat, args)
         torch.testing.assert_close(item["vector"], feat["replacement"].mean(0) - feat["deprecated"].mean(0))
         self.assertGreater(algo.gate_metrics(item, feat)["prompt_true_positive_rate"], .9)
-        self.assertLess(algo.gate_metrics(item, feat)["retain_false_positive_rate"], .1)
+        self.assertEqual(item["gate_architecture"], [16, 256, 1])
+        a = algo.gate_probability(item, feat["prompt"])
+        expected = (1 - torch.nn.functional.cosine_similarity(
+            feat["deprecated"] + a[:, None] * item["vector"], feat["replacement"], dim=-1)).mean()
+        self.assertAlmostEqual(item["gate_loss"], expected.item(), places=6)
+        self.assertLess(item["gate_loss"], (1 - torch.nn.functional.cosine_similarity(
+            feat["deprecated"], feat["replacement"], dim=-1)).mean().item())
+
+    def test_mlp_cached_decode_matches_teacher_forcing(self):
+        feat = {k: torch.randn(6, 16) for k in ("prompt", "deprecated", "replacement")}
+        item = algo.fit_gate(feat, argparse.Namespace(lr=.01, weight_decay=0., strength=.7, gate_steps=2))
+        prefix, completion = [4, 5, 6], [7, 8]
+        with self.engine.steering([item], len(prefix)):
+            full = self.engine.forward(prefix + completion).logits
+        with torch.no_grad(), self.engine.steering([item], len(prefix)):
+            initial = self.engine.model(torch.tensor([prefix]), use_cache=True)
+            next_output = self.engine.model(torch.tensor([[completion[0]]]),
+                                           past_key_values=initial.past_key_values, use_cache=True)
+        torch.testing.assert_close(initial.logits[:, -1], full[:, len(prefix)-1], atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(next_output.logits[:, -1], full[:, len(prefix)], atol=1e-6, rtol=1e-5)
+        self.assertEqual(len(self.engine.layer._forward_hooks), 0)
+
+    def test_step_logs_record_failure_and_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "test failure"):
+                with algo.step_log_files(directory):
+                    raise ValueError("test failure")
+            entry = json.loads((Path(directory) / "pipeline_errors.log").read_text())
+            self.assertEqual(entry["error_type"], "ValueError")
+            self.assertIsNone(algo.STEP_LOG_DIRECTORY.get())
+
+    def test_global_pipeline_off_on_subsets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            row = {"probing input": "def f(x): return ", "y_neg": "old(x)", "y_pos": "new(x)",
+                   "deprecated api": ["old"], "replacement api": "new", "library": "demo"}
+            algo.write_json(root / "D_forget.json", [row])
+            algo.write_json(root / "D_test.json", [row, dict(row, **{"probing input": "return "})])
+            algo.write_json(root / "D_test_U_dep.json", [row])
+            args = algo.parser().parse_args(["pipeline", "--forget", str(root / "D_forget.json"),
+                "--test", str(root / "D_test.json"), "--output", str(root / "out"),
+                "--gate-steps", "2", "--max-new-tokens", "2"])
+            with patch.object(algo, "load_engine", return_value=self.engine):
+                algo.pipeline(args)
+            report = algo.read_json(root / "out/comparison.json")
+            self.assertTrue(report["complete"])
+            for step, filename in algo.STEP_LOG_FILES.items():
+                if step == "error":
+                    continue
+                lines = (root / "out/logs" / filename).read_text(encoding="utf-8").splitlines()
+                self.assertTrue(lines, filename)
+                self.assertTrue(all(json.loads(line)["step"] == step for line in lines))
+            self.assertIsNone(algo.STEP_LOG_DIRECTORY.get())
+            for subset in ("U_dep", "U_nondep"):
+                for mode in ("baseline", "steered"):
+                    self.assertEqual(report["subsets"][subset][mode]["evaluated"], 1)
+            self.assertIn("mlp", algo.load_checkpoint(root / "out/step_001.pt")["bank"][0])
 
     def test_oversized_pair_keeps_retain_evaluation(self):
         row = {"id": "oversized", "prompt": "def f(x): return ",
@@ -205,7 +261,8 @@ class SteeringTests(unittest.TestCase):
             run(*training, "--resume", checkpoint_dir / "step_001.pt")
             second = algo.load_checkpoint(checkpoint_dir / "step_002.pt")
             self.assertEqual(len(second["bank"]), 2)
-            torch.testing.assert_close(first["bank"][0]["weight"], second["bank"][0]["weight"], rtol=0, atol=0)
+            for key in first["bank"][0]["mlp"]:
+                torch.testing.assert_close(first["bank"][0]["mlp"][key], second["bank"][0]["mlp"][key], rtol=0, atol=0)
             output = root / "report.json"
             run("evaluate", *common, "--checkpoints", checkpoint_dir, "--max-samples", "1",
                 "--max-new-tokens", "2", "--output", output)

@@ -3,6 +3,8 @@
 import argparse
 from collections import Counter, defaultdict
 from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -321,6 +323,8 @@ class Engine:
                 base = h[:, prompt_length - 1, :].float()
                 delta = torch.zeros_like(base)
                 for item in bank:
+                    if "mlp" in item:
+                        continue
                     state = {k: item[k].to(h.device) for k in ("mean", "scale", "weight", "bias", "vector")}
                     gate = torch.sigmoid(((base - state["mean"]) / state["scale"]) @ state["weight"] + state["bias"])
                     delta = delta + item["strength"] * gate.unsqueeze(-1) * state["vector"]
@@ -329,6 +333,14 @@ class Engine:
             else:
                 start = 0
             changed = h.clone()
+            for item in bank:
+                if "mlp" in item:
+                    base = h[:, start:, :].float()
+                    a = gate_probability(item, base)
+                    movement = item["strength"] * a.unsqueeze(-1) * item["vector"].to(h.device)
+                    changed[:, start:, :] += movement.to(h.dtype)
+                    log_step("7.forward_hook", layer=self.layer_index, a=a,
+                             delta=movement, h_out=changed[:, -1, :])
             changed[:, start:, :] = changed[:, start:, :] + delta.unsqueeze(1).to(h.dtype)
             return (changed,) + output[1:] if isinstance(output, tuple) else changed
 
@@ -449,7 +461,7 @@ def trial(args):
     report = {"metadata": metadata, "train_samples": item["train_samples"],
               "train_source_indices": [r["source_index"] for r in train_rows],
               "seed": args.seed, "max_new_tokens": args.max_new_tokens,
-              "strength": args.strength, "cosine_weight": args.cosine_weight,
+              "strength": args.strength, "objective": "paired_cosine",
               "gate_steps": args.gate_steps, "baseline": baseline, "steered": steered,
               "transitions": dict(transitions), "delta_retain_nll":
               steered["summary"]["retain_nll"] - baseline["summary"]["retain_nll"]}
@@ -465,7 +477,7 @@ def sample(rows, limit, seed):
 
 
 def features(engine, rows):
-    result = {name: [] for name in ("prompt", "replacement", "deprecated", "retain")}
+    result = {name: [] for name in ("prompt", "replacement", "deprecated")}
     skipped = []
     for i, row in enumerate(rows):
         try:
@@ -476,54 +488,117 @@ def features(engine, rows):
         result["prompt"].append(engine.hidden(prompt))
         result["replacement"].append(engine.hidden(prompt + good))
         result["deprecated"].append(engine.hidden(prompt + bad))
-        clean = engine.prompt_ids(row["retain"])
-        result["retain"].append(engine.hidden(clean[:max(1, len(clean) // 2)]))
         if (i + 1) % 25 == 0:
-            print(f"  extracted {i + 1}/{len(rows)}", flush=True)
+            log_step("2.hidden_states", extracted=len(result["prompt"]), processed=i + 1, total=len(rows))
     if not result["prompt"]:
         raise ValueError("No pairs fit the context window; increase --max-length")
     tensors = {key: torch.stack(value) for key, value in result.items()}
+    log_step("2.hidden_states", h_in=tensors["prompt"], h_neg=tensors["deprecated"], h_pos=tensors["replacement"], skipped=len(skipped))
     tensors["skipped_context_ids"] = skipped
     if skipped:
         print(f"  skipped {len(skipped)} oversized completions; IDs recorded in checkpoint", flush=True)
     return tensors
 
 
+STEP_LOG_DIRECTORY = ContextVar("step_log_directory", default=None)
+STEP_LOG_FILES = {
+    "1.data": "01_load_forget_and_test_data.log",
+    "2.hidden_states": "02_extract_hidden_states.log",
+    "3.means": "03_compute_deprecated_and_replacement_means.log",
+    "4.direction": "04_compute_steering_vector.log",
+    "5.gate_init": "05_initialize_mlp_gate.log",
+    "5.gate_train": "06_train_gate_with_paired_cosine_loss.log",
+    "6.gate_ready": "07_finalize_trained_gate.log",
+    "7.forward_hook": "08_apply_steering_forward_hook.log",
+    "8.generate": "09_generate_baseline_and_steered_outputs.log",
+    "9.comparison": "10_evaluate_test_subsets.log",
+    "10.artifacts": "11_save_pipeline_artifacts.log",
+    "error": "pipeline_errors.log",
+}
+
+
+@contextmanager
+def step_log_files(directory):
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    token = STEP_LOG_DIRECTORY.set(directory)
+    try:
+        yield
+    except Exception as error:
+        log_step("error", error_type=type(error).__name__, message=str(error))
+        raise
+    finally:
+        STEP_LOG_DIRECTORY.reset(token)
+
+
+def log_step(step, **values):
+    def summary(value):
+        if isinstance(value, torch.Tensor):
+            x = value.detach().float().cpu()
+            return {"shape": list(x.shape), "mean": x.mean().item(),
+                    "std": x.std(unbiased=False).item(), "norm": x.norm().item(),
+                    "preview": x.flatten()[:8].tolist()}
+        return value
+    line = json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(),
+                       "step": step, **{k: summary(v) for k, v in values.items()}}, ensure_ascii=True)
+    print(line, flush=True)
+    directory = STEP_LOG_DIRECTORY.get()
+    if directory is not None:
+        with (directory / STEP_LOG_FILES[step]).open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+
+def gate_probability(item, x):
+    if "mlp" not in item:  # Read legacy checkpoints without changing their behavior.
+        return (((x - item["mean"].to(x.device)) / item["scale"].to(x.device))
+                @ item["weight"].to(x.device) + item["bias"].to(x.device)).sigmoid()
+    state = {k: v.to(x.device) for k, v in item["mlp"].items()}
+    hidden = F.relu(F.linear(x.float(), state["0.weight"], state["0.bias"]))
+    return F.linear(hidden, state["2.weight"], state["2.bias"]).squeeze(-1).sigmoid()
+
+
 def fit_gate(feat, args):
-    rep_mean = feat["replacement"].mean(0)
-    vector = rep_mean - feat["deprecated"].mean(0)
+    h_neg, h_pos, h_in = feat["deprecated"], feat["replacement"], feat["prompt"]
+    dep_mean, rep_mean = h_neg.mean(0), h_pos.mean(0)
+    vector = rep_mean - dep_mean
     if not torch.isfinite(vector).all() or vector.norm() < 1e-8:
         raise ValueError("Nonfinite or zero steering direction")
-    positives = torch.cat([feat["prompt"], feat["deprecated"]])
-    negatives = torch.cat([feat["replacement"], feat["retain"]])
-    x = torch.cat([positives, negatives])
-    labels = torch.cat([torch.ones(len(positives)), torch.zeros(len(negatives))])
-    mean, scale = x.mean(0), x.std(0, unbiased=False).clamp_min(1e-4)
-    z = (x - mean) / scale
-    gate = torch.nn.Linear(x.shape[-1], 1)
-    torch.nn.init.zeros_(gate.weight)
-    torch.nn.init.zeros_(gate.bias)
+    log_step("3.means", v_dep=dep_mean, v_rep=rep_mean)
+    log_step("4.direction", v_steer=vector)
+    gate = torch.nn.Sequential(torch.nn.Linear(h_in.shape[-1], 256), torch.nn.ReLU(),
+                               torch.nn.Linear(256, 1))
     optimizer = torch.optim.AdamW(gate.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    for _ in range(args.gate_steps):
-        logits = gate(z).squeeze(-1)
-        probabilities = logits.sigmoid()
-        moved = positives + args.strength * probabilities[:len(positives), None] * vector
-        cosine = (1 - F.cosine_similarity(moved, rep_mean.expand_as(moved))).mean()
-        loss = F.binary_cross_entropy_with_logits(logits, labels) + args.cosine_weight * cosine
+    log_step("5.gate_init", architecture=[h_in.shape[-1], 256, 1],
+             objective="mean(1 - cos(h_neg + sigmoid(MLP(h_in))*v_steer, h_pos))")
+    for step in range(args.gate_steps):
+        probabilities = gate(h_in).squeeze(-1).sigmoid()
+        moved = h_neg + probabilities[:, None] * vector
+        loss = (1 - F.cosine_similarity(moved, h_pos, dim=-1)).mean()
+        if not torch.isfinite(loss):
+            raise ValueError("Nonfinite gate loss")
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    return {"vector": vector, "replacement_mean": rep_mean, "mean": mean, "scale": scale,
-            "weight": gate.weight.detach().squeeze(0), "bias": gate.bias.detach().squeeze(0),
-            "strength": args.strength, "gate_loss": loss.item()}
+        log_step("5.gate_train", iteration=step + 1, loss=loss.item(), a=probabilities)
+    item = {"vector": vector, "replacement_mean": rep_mean, "deprecated_mean": dep_mean,
+            "mlp": {k: v.detach().cpu().clone() for k, v in gate.state_dict().items()},
+            "strength": args.strength, "gate_input": "prompt_last_token",
+            "gate_architecture": [h_in.shape[-1], 256, 1]}
+    with torch.no_grad():
+        probabilities = gate_probability(item, h_in)
+        item["gate_loss"] = (1 - F.cosine_similarity(
+            h_neg + probabilities[:, None] * vector, h_pos, dim=-1)).mean().item()
+    log_step("6.gate_ready", loss=item["gate_loss"], a=probabilities)
+    return item
 
 
 def gate_metrics(item, feat):
-    def probability(x):
-        return (((x - item["mean"]) / item["scale"]) @ item["weight"] + item["bias"]).sigmoid()
-    return {"prompt_true_positive_rate": (probability(feat["prompt"]) >= .5).float().mean().item(),
-            "replacement_false_positive_rate": (probability(feat["replacement"]) >= .5).float().mean().item(),
-            "retain_false_positive_rate": (probability(feat["retain"]) >= .5).float().mean().item()}
+    a = gate_probability(item, feat["prompt"])
+    moved = feat["deprecated"] + a[:, None] * item["vector"]
+    return {"paired_cosine_loss": (1 - F.cosine_similarity(moved, feat["replacement"], dim=-1)).mean().item(),
+            "gate_mean": a.mean().item(),
+            "prompt_true_positive_rate": (a >= .5).float().mean().item(),
+            "replacement_false_positive_rate": (gate_probability(item, feat["replacement"]) >= .5).float().mean().item()}
 
 
 def save_checkpoint(path, metadata, bank):
@@ -550,7 +625,7 @@ def train(args):
     engine = load_engine(args, checkpoint["metadata"] if checkpoint else None)
     metadata = {"model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
                 "dataset_hash": dataset_hash, "task_order": [t["name"] for t in data["tasks"]],
-                "seed": args.seed, "method": "contrastive-mean+sigmoid-gate+cosine"}
+                "seed": args.seed, "method": "contrastive-mean+mlp256+paired-cosine+dynamic-hook"}
     if data.get("source"):
         metadata["dataset_source"] = data["source"]
     if args.quantization != "none":
@@ -586,7 +661,7 @@ def train(args):
         item["validation_samples"] = len(validation_features["prompt"])
         item["validation_skipped_context_ids"] = validation_features["skipped_context_ids"]
         item["training"] = {key: getattr(args, key) for key in
-                            ("gate_steps", "lr", "weight_decay", "cosine_weight", "strength")}
+                            ("gate_steps", "lr", "weight_decay", "strength")}
         bank.append(item)
         path = output / f"step_{len(bank):03d}.pt"
         if path.exists():
@@ -857,6 +932,73 @@ def generate(args):
     print(engine.generate(prompt, state["bank"], args.max_new_tokens))
 
 
+def pipeline(args):
+    output = Path(args.output)
+    if output.exists() and any(output.iterdir()):
+        raise ValueError("Pipeline output must be empty; choose another --output")
+    with step_log_files(output / "logs"):
+        _run_pipeline(args)
+
+
+def _run_pipeline(args):
+    """One global direction/gate, learned exclusively from raw D_forget pairs."""
+    torch.manual_seed(args.seed)
+    output = Path(args.output)
+    subsets = test_subsets(args.test)
+    if subsets is None:
+        raise ValueError("Place D_test_U_dep.json beside D_test.json to define both test subsets")
+    source = data_source(args.forget, args.test)
+    check_model_family(args.model, source)
+    raw = read_json(args.forget)
+    rows, skipped = [], []
+    for index, row in enumerate(raw):
+        fields = [row.get(k) for k in ("probing input", "y_neg", "y_pos")] if isinstance(row, dict) else []
+        if len(fields) != 3 or not all(isinstance(v, str) and v.strip() for v in fields):
+            skipped.append({"source_index": index, "reason": "Missing prompt or paired completion"})
+            continue
+        rows.append({"id": row.get("id", index), "prompt": fields[0],
+                     "deprecated": fields[1], "replacement": fields[2]})
+    rows = sample(rows, args.max_samples, args.seed)
+    test_rows, test_source = generation_dataset(args.test)
+    test_rows = sample(test_rows, args.eval_samples, args.seed)
+    log_step("1.data", total=len(raw), selected_pairs=len(rows), invalid=skipped,
+             test_selected=len(test_rows))
+    engine = load_engine(args)
+    feat = features(engine, rows)
+    item = fit_gate(feat, args)
+    item["task"] = "D_forget"
+    metadata = {"model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
+                "dtype": args.dtype, "quantization": args.quantization,
+                "method": "global-mean+mlp256+paired-cosine+dynamic-hook",
+                "dataset_source": source, "forget_sha256": file_sha256(args.forget)}
+    save_checkpoint(output / "step_000.pt", metadata, [])
+    save_checkpoint(output / "step_001.pt", metadata, [item])
+    torch.save(feat, output / "features.pt")
+    log_step("10.artifacts", checkpoints=[str(output / "step_000.pt"), str(output / "step_001.pt")],
+             features=str(output / "features.pt"))
+    report = {"metadata": metadata, "invalid_pairs": skipped,
+              "context_skipped_ids": feat["skipped_context_ids"], "test_source": test_source,
+              "examples": [], "subsets": {}, "complete": False}
+    write_json(output / "comparison.json", report)
+    for index, row in enumerate(test_rows):
+        example = {"source_index": row["source_index"], "subset": subsets[row["source_index"]]}
+        for mode, bank in (("baseline", []), ("steered", [item])):
+            generated = engine.generate(row["prompt"], bank, args.max_new_tokens)
+            example[mode] = {"generated": generated, **classify_generation(generated, row)}
+        report["examples"].append(example)
+        log_step("8.generate", index=index + 1, total=len(test_rows), **example)
+        if (index + 1) % 100 == 0:
+            write_json(output / "comparison.json", report)
+    for label in ("U_dep", "U_nondep"):
+        selected = [e for e in report["examples"] if e["subset"] == label]
+        report["subsets"][label] = {mode: generation_counts([e[mode] for e in selected])
+                                    for mode in ("baseline", "steered")}
+        log_step("9.comparison", subset=label, **report["subsets"][label])
+    report["complete"] = True
+    write_json(output / "comparison.json", report)
+    log_step("10.artifacts", comparison=str(output / "comparison.json"), complete=True)
+
+
 def parser():
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
@@ -875,7 +1017,7 @@ def parser():
     prep.add_argument("--seed", type=int, default=42)
     prep.set_defaults(func=prepare)
     for name, function in (("train", train), ("evaluate", evaluate), ("generate", generate),
-                           ("evaluate-api", evaluate_api), ("trial", trial)):
+                           ("evaluate-api", evaluate_api), ("trial", trial), ("pipeline", pipeline)):
         command = commands.add_parser(name)
         command.add_argument("--model", default="codellama/CodeLlama-7b-hf")
         command.add_argument("--device", default="auto")
@@ -885,6 +1027,19 @@ def parser():
         command.add_argument("--quantization", choices=["none", "4bit"], default="none")
         command.add_argument("--cache-dir", default=".cache/huggingface/hub")
         command.set_defaults(func=function)
+        if name == "pipeline":
+            command.add_argument("--forget", default="data/codellama/D_forget.json")
+            command.add_argument("--test", default="data/codellama/D_test.json")
+            command.add_argument("--output", default="results/paired_pipeline")
+            command.add_argument("--max-samples", type=int, default=0)
+            command.add_argument("--eval-samples", type=int, default=0)
+            command.add_argument("--gate-steps", type=int, default=300)
+            command.add_argument("--lr", type=float, default=.001)
+            command.add_argument("--weight-decay", type=float, default=0.)
+            command.add_argument("--strength", type=float, default=1.)
+            command.add_argument("--seed", type=int, default=42)
+            command.add_argument("--max-new-tokens", type=int, default=64)
+            continue
         if name == "trial":
             command.set_defaults(quantization="4bit", device="cuda", max_length=512)
             command.add_argument("--data", default="data/codellama/prepared.json")
@@ -896,7 +1051,6 @@ def parser():
             command.add_argument("--gate-steps", type=int, default=300)
             command.add_argument("--lr", type=float, default=.01)
             command.add_argument("--weight-decay", type=float, default=.01)
-            command.add_argument("--cosine-weight", type=float, default=.1)
             command.add_argument("--strength", type=float, default=1.)
             command.add_argument("--max-new-tokens", type=int, default=64)
             continue
@@ -931,7 +1085,6 @@ def parser():
             command.add_argument("--gate-steps", type=int, default=300)
             command.add_argument("--lr", type=float, default=.01)
             command.add_argument("--weight-decay", type=float, default=.01)
-            command.add_argument("--cosine-weight", type=float, default=.1)
             command.add_argument("--strength", type=float, default=1.)
         else:
             command.add_argument("--checkpoints", default="checkpoints/codellama_hf")
@@ -953,7 +1106,7 @@ def main():
         raise ValueError("--gate-steps must be positive")
     if hasattr(args, "val_fraction") and not 0 < args.val_fraction < 1:
         raise ValueError("--val-fraction must be between zero and one")
-    if args.command == "trial" and args.max_new_tokens < 1:
+    if args.command in ("trial", "pipeline") and args.max_new_tokens < 1:
         raise ValueError("trial requires positive --max-new-tokens")
     args.func(args)
 

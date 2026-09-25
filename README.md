@@ -1,3 +1,67 @@
+# Paired cosine steering pipeline
+
+Run from `project/`:
+
+```powershell
+.\.venv\Scripts\python.exe algo.py pipeline --model codellama/CodeLlama-7b-hf --output results/paired_pipeline 2>&1 | Tee-Object pipeline.log
+```
+
+Use `--quantization 4bit --device cuda --dtype float16` for the existing GPU setup.
+The default input is `data/codellama/D_forget.json`; evaluation uses `D_test.json`
+and the adjacent `D_test_U_dep.json` to define U_dep and its U_nondep complement.
+All valid raw pairs are used by default, without a validation split or deduplication.
+Missing pairs and oversized completions are recorded. N is the actual usable count,
+not a hard-coded 9,667. `--max-samples` and `--eval-samples` limit a smoke run.
+
+1. Extract last-token block outputs from x, x+y_neg and x+y_pos with frozen M0.
+2. Compute v_dep=mean(h_neg), v_rep=mean(h_pos), v_steer=v_rep-v_dep.
+3. Train sigmoid(MLP(h_in)), using Linear(H,256) -> ReLU -> Linear(256,1) -> sigmoid.
+   h_in is the last prompt-token state; loss is mean(1-cos(h_neg+a*v_steer,h_pos)).
+   There is no BCE, retain classifier, feature normalization, or cosine weighting.
+4. Hook decoder block L: h'=h+t*a(h)*v_steer, with t=`--strength`.
+   Recompute the gate at each generated token. Teacher forcing applies the same
+   tokenwise rule from the final prompt position onward. H comes from the model
+   (CodeLlama-7B uses 4096; a 2048-wide model uses 2048 -> 256 -> 1).
+5. Generate identical test prompts with steering off/on; report counts separately
+   for U_dep and U_nondep. Test targets do not train the gate.
+
+Logs print tensor shapes/statistics/previews, every optimizer-step loss, hook
+outputs, every paired generation, and subset summaries. Full features are saved
+in `features.pt`; checkpoints are `step_000.pt` and `step_001.pt`; generated text
+and counts are in `comparison.json`. Only `complete: true` means evaluation finished.
+Use a fresh output directory. Actual effectiveness requires a pretrained-model run.
+
+Each `pipeline` run automatically writes UTF-8 JSON-lines logs under `<output>/logs/`
+while printing the same events to the console. Each record includes a UTC timestamp.
+
+```text
+01_load_forget_and_test_data.log
+02_extract_hidden_states.log
+03_compute_deprecated_and_replacement_means.log
+04_compute_steering_vector.log
+05_initialize_mlp_gate.log
+06_train_gate_with_paired_cosine_loss.log
+07_finalize_trained_gate.log
+08_apply_steering_forward_hook.log
+09_generate_baseline_and_steered_outputs.log
+10_evaluate_test_subsets.log
+11_save_pipeline_artifacts.log
+```
+
+Files are created when their step runs. Failed runs also write `pipeline_errors.log`.
+Every optimizer iteration and every steering hook invocation is logged. Tensor logs
+contain statistics/previews; full extracted tensors are in `features.pt`. Logs and
+runtime artifacts are ignored by Git. Evaluation only generates on D_test.
+
+`train` and `trial` also use the new MLP and paired cosine objective, but keep their
+prepared-data task splits. Legacy linear checkpoints remain readable for inference;
+resume rejects older training methods. Retrain to obtain the new method.
+
+The notes below describe the previous experiment and its data/evaluation utilities;
+the old BCE/linear-gate method and its training flags have been superseded above.
+
+---
+
 # Continual API Unlearning with MLLMEraser Steering
 
 Adaptation of MLLMEraser for the code/API task in `Continual Unlearning Task MML.pdf`.

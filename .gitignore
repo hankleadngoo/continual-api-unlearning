@@ -9,3 +9,6 @@ checkpoints/
 results/
 .cache/
 .env
+
+.test_tmp/
+*.log
