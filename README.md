@@ -1,3 +1,9 @@
+Default server model: `deepseek-ai/deepseek-coder-1.3b-instruct`; default dataset
+family: `deepseek`. Run `bash run_script.sh` to train a fresh DeepSeek gate and
+evaluate all valid D_test examples. CodeLlama gates cannot be reused with DeepSeek.
+This change selects the model/data; prompts still use raw `probing input`, without
+the next-line instruction wrapper described in the comparison experiment.
+
 # Run on a Linux server with Conda
 
 Clone the repository and enter its root (the directory containing `algo.py`).
@@ -18,7 +24,7 @@ runs. Use `UPDATE_ENV=1 bash setup_conda.sh` after pulling dependency changes.
 GPU execution requires a compatible NVIDIA driver on the server.
 
 ```bash
-# Downloads the pinned CodeLlama dataset, trains and evaluates on D_test:
+# Downloads the pinned DeepSeek dataset, trains and evaluates on D_test:
 bash run_script.sh
 
 # Search t on the same D_test prompts (test-tuned results):

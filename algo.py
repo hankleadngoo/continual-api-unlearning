@@ -1067,14 +1067,14 @@ def parser():
     root = argparse.ArgumentParser(description=__doc__)
     commands = root.add_subparsers(dest="command", required=True)
     fetch = commands.add_parser("fetch-data", help="Download the pinned Hugging Face benchmark")
-    fetch.add_argument("--family", choices=DATASET_FAMILIES, default="codellama")
+    fetch.add_argument("--family", choices=DATASET_FAMILIES, default="deepseek")
     fetch.add_argument("--revision", default=DATASET_REVISION)
     fetch.add_argument("--output", default="data")
     fetch.set_defaults(func=fetch_data)
     prep = commands.add_parser("prepare")
-    prep.add_argument("--forget", default="data/codellama/D_forget.json")
-    prep.add_argument("--test", default="data/codellama/D_test.json")
-    prep.add_argument("--output", default="data/codellama/prepared.json")
+    prep.add_argument("--forget", default="data/deepseek/D_forget.json")
+    prep.add_argument("--test", default="data/deepseek/D_test.json")
+    prep.add_argument("--output", default="data/deepseek/prepared.json")
     prep.add_argument("--task-by", choices=["library", "api"], default="library")
     prep.add_argument("--task-order", help="Comma-separated tasks; default: alphabetical")
     prep.add_argument("--val-fraction", type=float, default=.1)
@@ -1083,7 +1083,7 @@ def parser():
     for name, function in (("train", train), ("evaluate", evaluate), ("generate", generate),
                            ("evaluate-api", evaluate_api), ("trial", trial), ("pipeline", pipeline)):
         command = commands.add_parser(name)
-        command.add_argument("--model", default="codellama/CodeLlama-7b-hf")
+        command.add_argument("--model", default="deepseek-ai/deepseek-coder-1.3b-instruct")
         command.add_argument("--device", default="auto")
         command.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float16")
         command.add_argument("--layer", type=int, default=-1)
@@ -1094,8 +1094,8 @@ def parser():
         if name == "pipeline":
             command.add_argument("--strength-grid", type=strength_grid,
                                  help="Sweep D_test strengths, e.g. 0,0.01,0.05,0.1,0.2,0.5,1; selects best in grid")
-            command.add_argument("--forget", default="data/codellama/D_forget.json")
-            command.add_argument("--test", default="data/codellama/D_test.json")
+            command.add_argument("--forget", default="data/deepseek/D_forget.json")
+            command.add_argument("--test", default="data/deepseek/D_test.json")
             command.add_argument("--output", default="results/paired_pipeline")
             command.add_argument("--max-samples", type=int, default=0)
             command.add_argument("--eval-samples", type=int, default=0)
@@ -1108,7 +1108,7 @@ def parser():
             continue
         if name == "trial":
             command.set_defaults(quantization="4bit", device="cuda", max_length=512)
-            command.add_argument("--data", default="data/codellama/prepared.json")
+            command.add_argument("--data", default="data/deepseek/prepared.json")
             command.add_argument("--library", default="numpy")
             command.add_argument("--train-samples", type=int, default=100)
             command.add_argument("--eval-samples", type=int, default=50)
@@ -1121,11 +1121,11 @@ def parser():
             command.add_argument("--max-new-tokens", type=int, default=64)
             continue
         if name == "evaluate-api":
-            command.add_argument("--forget", default="data/codellama/D_forget.json")
-            command.add_argument("--test", default="data/codellama/D_test.json")
+            command.add_argument("--forget", default="data/deepseek/D_forget.json")
+            command.add_argument("--test", default="data/deepseek/D_test.json")
             selection = command.add_mutually_exclusive_group()
             selection.add_argument("--checkpoint", help="Evaluate one checkpoint only")
-            selection.add_argument("--checkpoints", default="checkpoints/codellama_hf", help="Directory of stage checkpoints")
+            selection.add_argument("--checkpoints", default="checkpoints/deepseek_hf", help="Directory of stage checkpoints")
             command.add_argument("--output", default="results/api_counts.json")
             command.add_argument("--max-new-tokens", type=int, default=64)
             command.add_argument("--max-samples", type=int, default=0, help="Per raw dataset; 0 evaluates all rows")
@@ -1138,12 +1138,12 @@ def parser():
             prompt.add_argument("--prompt-file")
             command.add_argument("--max-new-tokens", type=int, default=128)
             continue
-        command.add_argument("--data", default="data/codellama/prepared.json")
+        command.add_argument("--data", default="data/deepseek/prepared.json")
         command.add_argument("--seed", type=int, default=42)
         command.add_argument("--max-samples", type=int, default=256 if name == "train" else 32,
                              help="Samples per task (evaluation: per task/category); 0 means all")
         if name == "train":
-            command.add_argument("--output", default="checkpoints/codellama_hf")
+            command.add_argument("--output", default="checkpoints/deepseek_hf")
             command.add_argument("--resume")
             command.add_argument("--stop-after", type=int, default=0,
                                  help="Stop at this total task count; 0 completes the schedule")
@@ -1153,7 +1153,7 @@ def parser():
             command.add_argument("--weight-decay", type=float, default=.01)
             command.add_argument("--strength", type=float, default=1.)
         else:
-            command.add_argument("--checkpoints", default="checkpoints/codellama_hf")
+            command.add_argument("--checkpoints", default="checkpoints/deepseek_hf")
             command.add_argument("--split", choices=["validation", "test"], default="validation")
             command.add_argument("--output", default="results/validation.json")
             command.add_argument("--max-new-tokens", type=int, default=0,

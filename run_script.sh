@@ -9,8 +9,8 @@ export PYTHONUNBUFFERED=1
 if [[ $# -gt 0 ]]; then
     exec "$CONDA_BIN" run --no-capture-output -n "$ENV_NAME" python -u algo.py "$@"
 fi
-MODEL="${MODEL:-codellama/CodeLlama-7b-hf}"
-FAMILY="${FAMILY:-codellama}"
+MODEL="${MODEL:-deepseek-ai/deepseek-coder-1.3b-instruct}"
+FAMILY="${FAMILY:-deepseek}"
 OUTPUT="${OUTPUT:-results/${FAMILY}_pipeline_$(date +%Y%m%d_%H%M%S)_$$}"
 QUANTIZATION="${QUANTIZATION:-none}"
 if [[ "${FETCH_DATA:-1}" == "1" ]]; then
