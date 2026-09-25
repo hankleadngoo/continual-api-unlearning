@@ -1,8 +1,22 @@
 Default server model: `deepseek-ai/deepseek-coder-1.3b-instruct`; default dataset
 family: `deepseek`. Run `bash run_script.sh` to train a fresh DeepSeek gate and
 evaluate all valid D_test examples. CodeLlama gates cannot be reused with DeepSeek.
-This change selects the model/data; prompts still use raw `probing input`, without
-the next-line instruction wrapper described in the comparison experiment.
+New DeepSeek runs use this exact instruction for training feature extraction and inference:
+
+````text
+Complete and output the next line for the following Python function:
+```python
+{code_context}
+```
+````
+
+Here `code_context` is the raw `probing input`. No additional chat template is
+applied. Completion targets are appended after this formatted prompt during
+paired feature extraction. Checkpoints record `prompt_template`; old checkpoints
+without that field retain raw prompts. Train a fresh gate to use the instruction.
+Use `bash run_script.sh pipeline --prompt-template next-line` to explicitly select
+it, including for a local model path whose name does not contain `deepseek`.
+The formatted prompt can be left-truncated when the context window is too short.
 
 # Run on a Linux server with Conda
 
@@ -30,7 +44,7 @@ bash run_script.sh
 # Search t on the same D_test prompts (test-tuned results):
 STRENGTH_GRID="0,0.01,0.025,0.05,0.1,0.2,0.5,1" bash run_script.sh
 
-# DeepSeek model and matching dataset; uses raw probing input, no prompt wrapper:
+# DeepSeek model and matching dataset; uses the next-line instruction:
 MODEL=deepseek-ai/deepseek-coder-1.3b-instruct FAMILY=deepseek bash run_script.sh
 
 # Quick run; EVAL_SAMPLES caps the total test count, not each subset:

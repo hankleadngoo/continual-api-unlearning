@@ -260,13 +260,20 @@ def get_layers(model):
 
 
 class Engine:
-    def __init__(self, model, tokenizer, layer, max_length):
+    def __init__(self, model, tokenizer, layer, max_length, prompt_template="raw"):
+        self.prompt_template = prompt_template
         self.model = model.eval().requires_grad_(False)
         self.tokenizer = tokenizer
         self.layer_index = layer
         self.layer = get_layers(model)[layer]
         self.max_length = max_length
         self.device = model.get_input_embeddings().weight.device
+
+    def format_prompt(self, code_context):
+        if self.prompt_template == "next-line":
+            return ("Complete and output the next line for the following Python function:\n"
+                    f"```python\n{code_context}\n```")
+        return code_context
 
     def ids(self, text):
         ids = self.tokenizer.encode(text, add_special_tokens=False)
@@ -283,7 +290,7 @@ class Engine:
     def pair_ids(self, row):
         good, bad = self.ids(row["replacement"]), self.ids(row["deprecated"])
         # Both alternatives see exactly the same left-truncated prompt.
-        prompt = self.prompt_ids(row["prompt"], max(len(good), len(bad)))
+        prompt = self.prompt_ids(self.format_prompt(row["prompt"]), max(len(good), len(bad)))
         return prompt, good, bad
 
     def forward(self, ids):
@@ -360,7 +367,7 @@ class Engine:
 
     @torch.no_grad()
     def generate(self, prompt, bank, max_new_tokens):
-        ids = self.prompt_ids(prompt, max_new_tokens)
+        ids = self.prompt_ids(self.format_prompt(prompt), max_new_tokens)
         x = torch.tensor([ids], device=self.device)
         with self.steering(bank, len(ids)):
             output = self.model.generate(input_ids=x, attention_mask=torch.ones_like(x),
@@ -379,6 +386,13 @@ def load_engine(args, metadata=None):
         raise ValueError("Use the same --quantization as the steering checkpoint")
     if metadata and "dtype" in metadata and args.dtype != metadata["dtype"]:
         raise ValueError("Use the same --dtype as the steering checkpoint")
+    requested_template = getattr(args, "prompt_template", "auto")
+    if metadata:
+        prompt_template = metadata.get("prompt_template", "raw")
+        if requested_template != "auto" and requested_template != prompt_template:
+            raise ValueError("Use the checkpoint prompt template; retrain to change it")
+    else:
+        prompt_template = ("next-line" if "deepseek" in args.model.lower() else "raw") if requested_template == "auto" else requested_template
     options = {}
     if quantization == "4bit":
         if not torch.cuda.is_available() or args.device == "cpu":
@@ -400,7 +414,7 @@ def load_engine(args, metadata=None):
     max_length = metadata["max_length"] if metadata else args.max_length
     if max_length > getattr(model.config, "max_position_embeddings", max_length):
         raise ValueError("--max-length exceeds this model's context window")
-    return Engine(model, tokenizer, layer, max_length)
+    return Engine(model, tokenizer, layer, max_length, prompt_template)
 
 
 def trial(args):
@@ -422,7 +436,7 @@ def trial(args):
         raise ValueError("Trial output already exists; use a new --output directory")
     torch.manual_seed(args.seed)
     engine = load_engine(args)
-    metadata = {"model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
+    metadata = {"prompt_template": engine.prompt_template, "model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
                 "quantization": args.quantization, "dtype": args.dtype, "dataset_source": data.get("source"),
                 "dataset_hash": fingerprint(json.dumps(data, sort_keys=True)), "library": args.library}
 
@@ -623,7 +637,7 @@ def train(args):
     dataset_hash = fingerprint(json.dumps(data, sort_keys=True))
     checkpoint = load_checkpoint(args.resume) if args.resume else None
     engine = load_engine(args, checkpoint["metadata"] if checkpoint else None)
-    metadata = {"model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
+    metadata = {"prompt_template": engine.prompt_template, "model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
                 "dataset_hash": dataset_hash, "task_order": [t["name"] for t in data["tasks"]],
                 "seed": args.seed, "method": "contrastive-mean+mlp256+paired-cosine+dynamic-hook"}
     if data.get("source"):
@@ -1029,10 +1043,11 @@ def _run_pipeline(args):
     log_step("1.data", total=len(raw), selected_pairs=len(rows), invalid=skipped,
              test_selected=len(test_rows))
     engine = load_engine(args)
+    log_step("1.data", prompt_template=engine.prompt_template, prompt_preview=engine.format_prompt(rows[0]["prompt"]) if rows else None)
     feat = features(engine, rows)
     item = fit_gate(feat, args)
     item["task"] = "D_forget"
-    metadata = {"model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
+    metadata = {"prompt_template": engine.prompt_template, "model": args.model, "layer": engine.layer_index, "max_length": engine.max_length,
                 "dtype": args.dtype, "quantization": args.quantization,
                 "method": "global-mean+mlp256+paired-cosine+dynamic-hook",
                 "dataset_source": source, "forget_sha256": file_sha256(args.forget)}
@@ -1084,6 +1099,8 @@ def parser():
                            ("evaluate-api", evaluate_api), ("trial", trial), ("pipeline", pipeline)):
         command = commands.add_parser(name)
         command.add_argument("--model", default="deepseek-ai/deepseek-coder-1.3b-instruct")
+        command.add_argument("--prompt-template", choices=["auto", "raw", "next-line"], default="auto",
+                             help="auto: next-line instruction for new DeepSeek runs; use saved template for checkpoints")
         command.add_argument("--device", default="auto")
         command.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float16")
         command.add_argument("--layer", type=int, default=-1)

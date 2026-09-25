@@ -78,6 +78,19 @@ class SteeringTests(unittest.TestCase):
                 raise RuntimeError("intentional")
         self.assertEqual(len(self.engine.layer._forward_hooks), 0)
 
+    def test_next_line_prompt_used_for_pairs_and_generation(self):
+        self.engine.prompt_template = "next-line"
+        context = "def f(x):"
+        expected = "Complete and output the next line for the following Python function:\n```python\ndef f(x):\n```"
+        self.assertEqual(self.engine.format_prompt(context), expected)
+        prompt, good, bad = self.engine.pair_ids({"prompt": context, "replacement": "new(x)", "deprecated": "old(x)"})
+        self.assertEqual(prompt, self.engine.ids(expected))
+        with patch.object(self.engine.model, "generate", return_value=torch.tensor([prompt + [4]])) as mocked:
+            self.engine.generate(context, [], 1)
+        self.assertEqual(mocked.call_args.kwargs["input_ids"][0].tolist(), prompt)
+        self.assertEqual(good, self.engine.ids("new(x)"))
+        self.assertEqual(bad, self.engine.ids("old(x)"))
+
     def test_direction_and_gate(self):
         feat = {"prompt": torch.randn(8, 16) - 1, "deprecated": torch.randn(8, 16) - 1,
                 "replacement": torch.randn(8, 16) + 1, "retain": torch.randn(8, 16) + 1}
