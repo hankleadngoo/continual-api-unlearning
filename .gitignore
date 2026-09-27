@@ -11,7 +11,7 @@ results/
 .env
 
 .test_tmp/
-*.log
+# *.log
 
 slurm-*.out
 slurm-*.err
