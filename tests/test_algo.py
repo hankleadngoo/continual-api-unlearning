@@ -129,31 +129,38 @@ class SteeringTests(unittest.TestCase):
             self.assertEqual(entry["error_type"], "ValueError")
             self.assertIsNone(algo.STEP_LOG_DIRECTORY.get())
 
-    def test_strength_search_counts_selection_and_baseline_reuse(self):
-        row = {"prompt": "x", "source_index": 0, "deprecated api": ["old"], "replacement api": "new"}
+    def test_batch_generation_matches_single_for_unequal_prompts(self):
+        prompts = ["def f(x): return ", "x", "def f(x): return old(x) + "]
+        feat = {key: torch.randn(4, 16) for key in ("prompt", "deprecated", "replacement")}
+        item = algo.fit_gate(feat, argparse.Namespace(lr=.01, weight_decay=0., strength=.5, gate_steps=2))
+        for template in ("raw", "next-line"):
+            self.engine.prompt_template = template
+            for bank in ([], [item]):
+                individual = [self.engine.generate(prompt, bank, 3) for prompt in prompts]
+                batched = self.engine.generate_batch(prompts, bank, 3)
+                self.assertEqual(individual, batched)
+        self.assertEqual(len(self.engine.layer._forward_hooks), 0)
+
+    def test_fixed_strength_batched_counts_and_order(self):
+        rows = [{"prompt": text, "source_index": i, "deprecated api": ["old"], "replacement api": "new"}
+                for i, text in enumerate(["long prompt here", "x", "medium prompt"])]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            algo.write_json(root / "test.json", [row])
-            args = argparse.Namespace(strength_grid=[0., .1, 1.], strength=1.,
-                                      test=str(root / "test.json"), seed=42, max_new_tokens=2)
-            def generate(prompt, bank, limit):
-                return "old(x)" if not bank else "new(x)" if bank[0]["strength"] == .1 else "other(x)"
-            with patch.object(self.engine, "generate", side_effect=generate) as mocked:
-                best, paired, search = algo.evaluate_strengths(
-                    self.engine, self.item, [row], {0: "U_dep"}, args, root)
-            self.assertEqual(mocked.call_count, 3)
-            self.assertEqual(best["strength"], .1)
-            self.assertEqual(best["summary"]["correct_rep_count"], 1)
-            self.assertEqual(search["candidates"][0]["summary"]["deprecated_count"], 1)
-            self.assertEqual(search["candidates"][2]["summary"]["mismatch_count"], 1)
-            self.assertTrue(search["complete"])
-            self.assertEqual(paired[0]["steered"]["generated"], "new(x)")
-            tied = [dict(best, strength=.5), dict(best, strength=.1)]
-            self.assertEqual(algo.select_strength(tied)["strength"], .1)
-        self.assertEqual(algo.strength_grid(".1,0,.1"), [0., .1])
-        for invalid in ("nan", "inf", "-1", "", "abc"):
-            with self.assertRaises(argparse.ArgumentTypeError):
-                algo.strength_grid(invalid)
+            algo.write_json(root / "test.json", rows)
+            args = argparse.Namespace(batch_size=2, test=str(root / "test.json"), seed=42, max_new_tokens=2)
+            def generate(prompts, bank, limit):
+                if bank:
+                    self.assertEqual(bank[0]["strength"], .5)
+                return ["new(x)" if bank else "old(x)" for _ in prompts]
+            with patch.object(self.engine, "generate_batch", side_effect=generate) as mocked:
+                best, paired, report = algo.evaluate_strengths(
+                    self.engine, self.item, rows, {0: "U_dep", 1: "U_nondep", 2: "U_dep"}, args, root)
+            self.assertEqual(mocked.call_count, 4)
+            self.assertEqual(best["strength"], .5)
+            self.assertEqual(best["summary"]["correct_rep_count"], 3)
+            self.assertEqual(report["candidates"][0]["summary"]["deprecated_count"], 3)
+            self.assertEqual([e["source_index"] for e in paired], [0, 1, 2])
+            self.assertFalse(report["test_tuned"])
 
     def test_global_pipeline_off_on_subsets(self):
         with tempfile.TemporaryDirectory() as directory:

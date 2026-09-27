@@ -15,6 +15,7 @@ import re
 import sys
 import textwrap
 import tokenize
+import time
 
 import torch
 import torch.nn.functional as F
@@ -320,10 +321,16 @@ class Engine:
             return
         delta = None
         first = True
+        device_bank = None
 
         def hook(module, inputs, output):
-            nonlocal delta, first
+            nonlocal delta, first, device_bank
             h = output[0] if isinstance(output, tuple) else output
+            log_hook = first
+            if device_bank is None:
+                device_bank = [{**item, "mlp": {k: v.to(h.device) for k, v in item["mlp"].items()},
+                                "vector": item["vector"].to(h.device)} if "mlp" in item else item
+                               for item in bank]
             if first:
                 if h.shape[1] < prompt_length:
                     raise ValueError("Initial forward does not contain the full prompt")
@@ -340,14 +347,15 @@ class Engine:
             else:
                 start = 0
             changed = h.clone()
-            for item in bank:
+            for item in device_bank:
                 if "mlp" in item:
                     base = h[:, start:, :].float()
                     a = gate_probability(item, base)
                     movement = item["strength"] * a.unsqueeze(-1) * item["vector"].to(h.device)
                     changed[:, start:, :] += movement.to(h.dtype)
-                    log_step("7.forward_hook", layer=self.layer_index, a=a,
-                             delta=movement, h_out=changed[:, -1, :])
+                    if log_hook:
+                        log_step("7.forward_hook", layer=self.layer_index, phase="prefill", batch_size=h.shape[0], a=a,
+                                 delta=movement, h_out=changed[:, -1, :])
             changed[:, start:, :] = changed[:, start:, :] + delta.unsqueeze(1).to(h.dtype)
             return (changed,) + output[1:] if isinstance(output, tuple) else changed
 
@@ -374,6 +382,27 @@ class Engine:
                                          max_new_tokens=max_new_tokens, do_sample=False,
                                          use_cache=True, pad_token_id=self.tokenizer.eos_token_id)
         return self.tokenizer.decode(output[0, len(ids):], skip_special_tokens=True)
+
+    @torch.inference_mode()
+    def generate_batch(self, prompts, bank, max_new_tokens):
+        if not prompts:
+            return []
+        sequences = [self.prompt_ids(self.format_prompt(prompt), max_new_tokens) for prompt in prompts]
+        width = max(map(len, sequences))
+        pad = self.tokenizer.pad_token_id
+        if pad is None:
+            pad = self.tokenizer.eos_token_id
+        if pad is None:
+            raise ValueError("Batch generation requires a pad or EOS token")
+        ids = torch.full((len(sequences), width), pad, dtype=torch.long, device=self.device)
+        mask = torch.zeros_like(ids)
+        for index, sequence in enumerate(sequences):
+            ids[index, -len(sequence):] = torch.tensor(sequence, device=self.device)
+            mask[index, -len(sequence):] = 1
+        with self.steering(bank, width):
+            generated = self.model.generate(input_ids=ids, attention_mask=mask,
+                max_new_tokens=max_new_tokens, do_sample=False, use_cache=True, pad_token_id=pad)
+        return self.tokenizer.batch_decode(generated[:, width:], skip_special_tokens=True)
 
 
 def load_engine(args, metadata=None):
@@ -946,44 +975,44 @@ def generate(args):
     print(engine.generate(prompt, state["bank"], args.max_new_tokens))
 
 
-def strength_grid(value):
-    try:
-        values = [float(part.strip()) for part in value.split(",")]
-    except ValueError as error:
-        raise argparse.ArgumentTypeError("Use comma-separated finite nonnegative strengths") from error
-    if not values or any(not math.isfinite(t) or t < 0 for t in values):
-        raise argparse.ArgumentTypeError("Strengths must be finite and nonnegative")
-    return sorted(set([0.0] + values))
-
-
-def select_strength(candidates):
-    # Prefer actual replacement success; reducing dep by producing garbage is not success.
-    return min(candidates, key=lambda c: (-c["summary"]["correct_rep_count"],
-                                         c["summary"]["deprecated_count"], c["strength"]))
-
-
 def evaluate_strengths(engine, item, rows, subsets, args, output):
     if not rows:
         raise ValueError("No valid D_test examples to evaluate")
-    grid = getattr(args, "strength_grid", None)
-    strengths = grid if grid is not None else sorted(set([0., args.strength]))
+    strengths = [0., 0.5]
+    batch_size = args.batch_size
+    if batch_size < 1:
+        raise ValueError("--batch-size must be positive")
     search = {"complete": False, "selection_dataset": "D_test", "selected_rows": len(rows),
               "test_sha256": file_sha256(args.test), "seed": args.seed,
               "max_new_tokens": args.max_new_tokens,
-              "test_tuned": grid is not None,
-              "selection_rule": "max correct_rep_count, then min deprecated_count, then min strength",
+              "test_tuned": False, "batch_size": batch_size,
+              "selection_rule": "fixed strength 0.5; no test tuning",
               "candidates": []}
     baseline = None
     for strength in strengths:
         examples = []
         bank = [] if strength == 0 else [dict(item, strength=strength)]
-        for index, row in enumerate(rows):
-            generated = engine.generate(row["prompt"], bank, args.max_new_tokens)
-            example = {"source_index": row["source_index"], "subset": subsets[row["source_index"]],
-                       "generated": generated, **classify_generation(generated, row)}
-            examples.append(example)
-            log_step("8.generate", strength=strength, index=index + 1, total=len(rows), **example)
-        candidate = {"strength": strength, "summary": generation_counts(examples),
+        started = time.perf_counter()
+        # Group similar lengths to reduce padding, then restore original sample order.
+        ordered = sorted(enumerate(rows), key=lambda pair: len(engine.prompt_ids(
+            engine.format_prompt(pair[1]["prompt"]), args.max_new_tokens)))
+        indexed_examples = {}
+        for offset in range(0, len(ordered), batch_size):
+            batch = ordered[offset:offset + batch_size]
+            outputs = engine.generate_batch([row["prompt"] for _, row in batch], bank, args.max_new_tokens)
+            if len(outputs) != len(batch):
+                raise RuntimeError("Batch output count does not match input count")
+            for (index, row), generated in zip(batch, outputs):
+                example = {"source_index": row["source_index"], "subset": subsets[row["source_index"]],
+                           "generated": generated, **classify_generation(generated, row)}
+                indexed_examples[index] = example
+                log_step("8.generate", strength=strength, index=index + 1, total=len(rows), **example)
+            log_step("8.generate", strength=strength, processed=min(offset + batch_size, len(rows)),
+                     batch_size=len(batch), elapsed_seconds=time.perf_counter() - started)
+        examples = [indexed_examples[index] for index in range(len(rows))]
+        elapsed = time.perf_counter() - started
+        candidate = {"strength": strength, "elapsed_seconds": elapsed, "samples_per_second": len(rows) / elapsed,
+                     "summary": generation_counts(examples),
                      "subsets": {label: generation_counts([e for e in examples if e["subset"] == label])
                                  for label in ("U_dep", "U_nondep")}}
         path = output / "strength_candidates" / f"t_{strength!r}.json"
@@ -998,12 +1027,11 @@ def evaluate_strengths(engine, item, rows, subsets, args, output):
               f"rep={counts['correct_rep_count']} | mismatch={counts['mismatch_count']}", flush=True)
         if strength == 0:
             baseline = examples
-        write_json(output / "strength_search.json", search)
-    best = select_strength(search["candidates"]) if grid is not None else next(
-        c for c in search["candidates"] if c["strength"] == args.strength)
+        write_json(output / "fixed_strength_evaluation.json", search)
+    best = next(c for c in search["candidates"] if c["strength"] == 0.5)
     search.update(complete=True, best_strength=best["strength"], best_summary=best["summary"])
-    write_json(output / "strength_search.json", search)
-    log_step("9.comparison", selection="best_in_grid" if grid is not None else "fixed_strength",
+    write_json(output / "fixed_strength_evaluation.json", search)
+    log_step("9.comparison", selection="fixed_strength",
              strength=best["strength"], **best["summary"])
     chosen = read_json(output / best["examples_file"])["examples"]
     paired = [{"source_index": base["source_index"], "subset": base["subset"],
@@ -1022,6 +1050,7 @@ def pipeline(args):
 def _run_pipeline(args):
     """One global direction/gate, learned exclusively from raw D_forget pairs."""
     torch.manual_seed(args.seed)
+    args.strength = 0.5
     output = Path(args.output)
     subsets = test_subsets(args.test)
     if subsets is None:
@@ -1039,7 +1068,9 @@ def _run_pipeline(args):
                      "deprecated": fields[1], "replacement": fields[2]})
     rows = sample(rows, args.max_samples, args.seed)
     test_rows, test_source = generation_dataset(args.test)
-    test_rows = sample(test_rows, args.eval_samples, args.seed)
+    if args.eval_samples < 1:
+        raise ValueError("--eval-samples must be positive for the 500-sample pipeline")
+    test_rows = sample(test_rows, min(args.eval_samples, 500), args.seed)
     log_step("1.data", total=len(raw), selected_pairs=len(rows), invalid=skipped,
              test_selected=len(test_rows))
     engine = load_engine(args)
@@ -1067,7 +1098,7 @@ def _run_pipeline(args):
     report["selection_rule"] = search["selection_rule"]
     report["summary"] = {mode: generation_counts([e[mode] for e in paired])
                          for mode in ("baseline", "steered")}
-    save_checkpoint(output / "best_strength.pt", metadata, [dict(item, strength=best["strength"])])
+    save_checkpoint(output / "steered_t05.pt", metadata, [dict(item, strength=best["strength"])])
     for label in ("U_dep", "U_nondep"):
         selected = [e for e in report["examples"] if e["subset"] == label]
         report["subsets"][label] = {mode: generation_counts([e[mode] for e in selected])
@@ -1109,17 +1140,16 @@ def parser():
         command.add_argument("--cache-dir", default=".cache/huggingface/hub")
         command.set_defaults(func=function)
         if name == "pipeline":
-            command.add_argument("--strength-grid", type=strength_grid,
-                                 help="Sweep D_test strengths, e.g. 0,0.01,0.05,0.1,0.2,0.5,1; selects best in grid")
+            command.add_argument("--batch-size", type=int, default=8)
             command.add_argument("--forget", default="data/deepseek/D_forget.json")
             command.add_argument("--test", default="data/deepseek/D_test.json")
             command.add_argument("--output", default="results/paired_pipeline")
             command.add_argument("--max-samples", type=int, default=0)
-            command.add_argument("--eval-samples", type=int, default=0)
+            command.add_argument("--eval-samples", type=int, default=500)
             command.add_argument("--gate-steps", type=int, default=300)
             command.add_argument("--lr", type=float, default=.001)
             command.add_argument("--weight-decay", type=float, default=0.)
-            command.add_argument("--strength", type=float, default=1.)
+            command.add_argument("--strength", type=float, choices=[0.5], default=0.5)
             command.add_argument("--seed", type=int, default=42)
             command.add_argument("--max-new-tokens", type=int, default=64)
             continue

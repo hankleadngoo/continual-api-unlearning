@@ -1,3 +1,40 @@
+# Current server run: fixed t=0.5, at most 500 test examples
+
+```bash
+git pull
+bash run_script.sh
+# Increase batch size if GPU memory permits:
+BATCH_SIZE=16 bash run_script.sh
+# Detached run:
+mkdir -p logs
+nohup env BATCH_SIZE=8 bash run_script.sh > logs/server_run.log 2>&1 < /dev/null &
+# Or submit from repository root:
+sbatch run_slurm.sh
+```
+
+The pipeline evaluates baseline OFF and steering ON (t=0.5) on the same deterministic
+sample of at most 500 valid D_test rows TOTAL, not 500 per subset. It no longer
+searches strengths; `STRENGTH_GRID` is unused and `--strength-grid` is removed.
+`EVAL_SAMPLES` may reduce the sample; larger values are capped at 500. Training
+still uses all valid D_forget pairs unless `TRAIN_SAMPLES` is set.
+
+Generation uses batches of 8 by default, left padding and attention masks. Prompts
+are grouped by token length to reduce padding; reports restore original sample
+order. Baseline and steered passes each generate the sample once. Increase
+`BATCH_SIZE` for throughput or decrease it on GPU out-of-memory errors.
+
+Every stage still logs. The forward-hook log records prefill once per batch;
+steering still applies at every decode token, without per-token CPU logging.
+MLP weights are transferred to the layer device once per generation batch.
+Each generated sample and each batch's progress are logged. Evaluation reports
+exact dep/rep/mismatch counts, subset counts, seconds and samples/second.
+
+Outputs: `comparison.json`, `fixed_strength_evaluation.json`,
+`strength_candidates/t_*.json`, and the fixed checkpoint `steered_t05.pt`.
+Older instructions about strength search or full-test defaults below are historical
+and superseded by this section. The fixed pipeline uses DeepSeek's next-line
+instruction consistently for training and inference.
+
 Default server model: `deepseek-ai/deepseek-coder-1.3b-instruct`; default dataset
 family: `deepseek`. Run `bash run_script.sh` to train a fresh DeepSeek gate and
 evaluate all valid D_test examples. CodeLlama gates cannot be reused with DeepSeek.
